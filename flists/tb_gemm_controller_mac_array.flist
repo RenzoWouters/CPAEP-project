@@ -1,0 +1,3 @@
+rtl/common/ceiling_counter.sv
+rtl/gemm/gemm_controller_mac_array.sv
+tb/tb_gemm_controller_mac_array.sv

@@ -34,7 +34,7 @@
 // - done_o       : Done signal indicating completion of the GeMM operation.
 //---------------------------
 
-module gemm_accelerator_top #(
+module gemm_accelerator_top_mac_array #(
   parameter int unsigned InDataWidth = 8,
   parameter int unsigned OutDataWidth = 32,
   parameter int unsigned AddrWidth = 16,

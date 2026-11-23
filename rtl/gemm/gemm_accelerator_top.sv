@@ -183,7 +183,7 @@ module gemm_accelerator_top #(
   //---------------------------
 
   // The MAC PE instantiation and data path logics
-  general_mac_pe #(
+  /*general_mac_pe #(
     .InDataWidth  ( InDataWidth            ),
     .NumInputs    ( 1                      ),
     .OutDataWidth ( OutDataWidth           )
@@ -197,6 +197,32 @@ module gemm_accelerator_top #(
     .init_save_i  ( init_save              ),
     .acc_clr_i    ( !busy                  ),
     .c_o          ( sram_c_wdata_o         )
+  );*/
+
+  // Signalen tussen datapad/muxing en de 512-MAC array (16 x 32)
+  localparam int unsigned NumCores    = 16;
+  localparam int unsigned NumInputs   = 32;
+
+  logic signed [NumCores-1:0][NumInputs-1:0][InDataWidth-1:0] array_a_in;
+  logic signed [NumCores-1:0][NumInputs-1:0][InDataWidth-1:0] array_b_in;
+  logic signed [NumCores-1:0][OutDataWidth-1:0]               array_c_out;
+
+  // 16 x (32 x 1) = 512 MACs
+  mac_array #(
+    .InDataWidth  ( InDataWidth  ),
+    .NumCores     ( NumCores     ),
+    .NumInputs    ( NumInputs    ),
+    .OutDataWidth ( OutDataWidth )
+  ) i_mac_array (
+    .clk_i        ( clk_i        ),
+    .rst_ni       ( rst_ni       ),
+    .a_i          ( array_a_in   ),
+    .b_i          ( array_b_in   ),
+    .a_valid_i    ( valid_data   ),
+    .b_valid_i    ( valid_data   ),
+    .init_save_i  ( init_save    ),
+    .acc_clr_i    ( !busy        ),
+    .c_o          ( array_c_out  )
   );
 
 endmodule

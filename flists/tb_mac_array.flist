@@ -1,0 +1,4 @@
+rtl/common/metrics_pkg.sv
+rtl/gemm/general_mac_pe.sv
+rtl/gemm/mac_array.sv
+tb/tb_mac_array.sv

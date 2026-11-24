@@ -39,6 +39,7 @@ module tb_mac_array_gemm;
     int unsigned N;
   } test_case_t;
 
+  /*
   // Only the first six cases contribute to the project latency score.
   localparam int unsigned NumWorkloads = 6;
   localparam int unsigned NumCases     = 11;
@@ -58,6 +59,35 @@ module tb_mac_array_gemm;
     '{"Cache A repeat",  1,    1, 32},
     '{"Single block",    1,    1,  1}
   };
+  */
+
+  // Only the first six cases contribute to the project latency score.
+  localparam int unsigned NumWorkloads = 6;
+  localparam int unsigned NumCases     = 17;
+
+  test_case_t test_cases [NumCases] = '{
+    // name            M     K     N
+    '{"GeMM 1",         64,   64, 32},
+    '{"GeMM 2",         64,  128, 32},
+    '{"GeMM 3",         64,  576, 32},
+    '{"GeMV 1",       1536,  576,  1},
+    '{"GeMV 2",       3072, 1024,  1},
+    '{"GeMV 3",       2816, 2048,  1},
+    // Small integration cases, excluded from the average workload score.
+    '{"GeMM tails",      3,   65, 17},
+    '{"GeMV tails",     17,   33,  1},
+    '{"Cache A first",   1,    1, 32},
+    '{"Cache A repeat",  1,    1, 32},
+    '{"Single block",    1,    1,  1},
+    // Extra targeted cases for multi-row/tail/cache/mode-switch coverage.
+    '{"GeMM 2x18",       2,   33, 18},
+    '{"GeMM 1x17",       1,   65, 17},
+    '{"GeMV 1x65",       1,   65,  1},
+    '{"GeMV 16x64",     16,   64,  1},
+    '{"GeMM alt",        4,   34, 18},
+    '{"GeMV alt",        5,   34,  1}
+  };
+
 
   int unsigned     case_cycles [NumCases];
   real             case_energy [NumCases];
@@ -198,6 +228,12 @@ module tb_mac_array_gemm;
     // different A data at word address zero, without any intervening reset.
     A_ref[0] = (test_id % 2 == 0) ? 8'sh80  : 8'sd127;
     B_ref[0] = (test_id % 2 == 0) ? 8'sd127 : 8'sh80;
+
+    // Exercise extreme signed int8 values at the end of A and B as well.
+    if ((m_sz * k_sz) > 1)
+      A_ref[m_sz*k_sz - 1] = (test_id % 2 == 0) ? 8'sd127 : 8'sh80;
+    if ((k_sz * n_sz) > 1)
+      B_ref[k_sz*n_sz - 1] = (test_id % 2 == 0) ? 8'sh80  : 8'sd127;
 
     // Padding is zero. C is poisoned so unwritten results cannot pass silently.
     for (int unsigned w = 0; w < a_used_words; w++) i_sram_a.memory[w] = '0;

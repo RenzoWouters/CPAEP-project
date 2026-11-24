@@ -5,4 +5,4 @@ rtl/gemm/general_mac_pe.sv
 rtl/gemm/mac_array.sv
 rtl/gemm/gemm_controller_mac_array.sv
 rtl/gemm/gemm_accelerator_top_mac_array.sv
-tb/tb_gemm_mac_array.sv
+tb/tb_mac_array_gemm.sv

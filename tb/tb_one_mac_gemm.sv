@@ -50,20 +50,24 @@ module tb_one_mac_gemm;
   //---------------------------
   test_case_t test_cases [NumCases] = '{
     //  name       M   K   N
+
     '{"GeMM 1",   4, 64, 16},
     '{"GeMM 2",  16, 64,  4},
     '{"GeMM 3",  32, 32, 32},
     '{"GeMV 1",  32, 32,  1},
     '{"GeMV 2",  64, 32,  1},
     '{"GeMV 3",  64, 64,  1}
+
+
     //DESIGN NOTE:
     // Target workloads for the test cases uncomment for later
-    // {"GeMM WL1",   64, 64, 32},
-    // {"GeMM WL2",   64, 128, 32},
-    // {"GeMM WL3",   64, 576, 32},
-    // {"GeMV WL1",   1536, 576, 1},
-    // {"GeMV WL2",   3072, 1024, 1},
-    // {"GeMV WL3",   2816, 2048, 1}
+    /*{"GeMM WL1",   64, 64, 32},
+    {"GeMM WL2",   64, 128, 32},
+    {"GeMM WL3",   64, 576, 32},
+    {"GeMV WL1",   1536, 576, 1},
+    {"GeMV WL2",   3072, 1024, 1},
+    {"GeMV WL3",   2816, 2048, 1}
+    */
   };
 
   // Per-case results, printed in the summary at the end

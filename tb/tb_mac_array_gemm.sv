@@ -39,28 +39,6 @@ module tb_mac_array_gemm;
     int unsigned N;
   } test_case_t;
 
-  /*
-  // Only the first six cases contribute to the project latency score.
-  localparam int unsigned NumWorkloads = 6;
-  localparam int unsigned NumCases     = 11;
-
-  test_case_t test_cases [NumCases] = '{
-    // name            M     K     N
-    '{"GeMM 1",         64,   64, 32},
-    '{"GeMM 2",         64,  128, 32},
-    '{"GeMM 3",         64,  576, 32},
-    '{"GeMV 1",       1536,  576,  1},
-    '{"GeMV 2",       3072, 1024,  1},
-    '{"GeMV 3",       2816, 2048,  1},
-    // Small integration cases, excluded from the average workload score.
-    '{"GeMM tails",      3,   65, 17},
-    '{"GeMV tails",     17,   33,  1},
-    '{"Cache A first",   1,    1, 32},
-    '{"Cache A repeat",  1,    1, 32},
-    '{"Single block",    1,    1,  1}
-  };
-  */
-
   // Only the first six cases contribute to the project latency score.
   localparam int unsigned NumWorkloads = 6;
   localparam int unsigned NumCases     = 17;
@@ -88,10 +66,10 @@ module tb_mac_array_gemm;
     '{"GeMV alt",        5,   34,  1}
   };
 
-
   int unsigned     case_cycles [NumCases];
   real             case_energy [NumCases];
   real             case_sram_energy [NumCases];
+  real             case_mac_util [NumCases];
   int unsigned     case_errors [NumCases];
   longint unsigned case_a_reads [NumCases];
   longint unsigned case_b_reads [NumCases];
@@ -117,6 +95,7 @@ module tb_mac_array_gemm;
   int unsigned active_case;
   int unsigned a_used_words, b_used_words, c_used_words;
   longint unsigned a_reads, b_reads, c_writes;
+  longint unsigned mac_compute_cycles, mac_active_lanes;
   bit monitor_active, case_finished;
   int unsigned seed_state;
 
@@ -220,6 +199,8 @@ module tb_mac_array_gemm;
     a_reads = 0;
     b_reads = 0;
     c_writes = 0;
+    mac_compute_cycles = 0;
+    mac_active_lanes = 0;
 
     // Truncation to signed int8 samples the full -128..127 range.
     foreach (A_ref[i]) A_ref[i] = InDataWidth'($urandom());
@@ -365,7 +346,7 @@ module tb_mac_array_gemm;
   endtask
 
   //---------------------------
-  // Monitor physical SRAM transactions at their accepting clock edge.
+  // Monitor physical SRAM transactions and MAC utilization at rising clock edges.
   // Do not sample read data here: it is updated after the edge by the SRAM.
   //---------------------------
   always @(posedge clk_i) begin
@@ -378,6 +359,11 @@ module tb_mac_array_gemm;
       end else begin
         if (case_finished && (sram_a_re || sram_b_re || sram_c_we))
           $fatal(1, "[%0s] SRAM transaction after done.", test_cases[active_case].name);
+        if (!case_finished && i_dut.valid_data) begin
+          mac_compute_cycles++;
+          mac_active_lanes += longint'(i_dut.mac_core_count_q) *
+                              longint'(i_dut.mac_input_count_q);
+        end
         if (sram_a_re) begin
           if ($isunknown(sram_a_addr) || sram_a_addr >= a_used_words)
             $fatal(1, "[%0s] Invalid A word address %0h (used words=%0d).",
@@ -429,6 +415,8 @@ module tb_mac_array_gemm;
     a_reads = 0;
     b_reads = 0;
     c_writes = 0;
+    mac_compute_cycles = 0;
+    mac_active_lanes = 0;
     seed_state = RandomSeed;
     void'($urandom(seed_state));
 
@@ -463,11 +451,31 @@ module tb_mac_array_gemm;
                                    real'(c_writes) * OutDataWidth);
       verify_result_c(case_errors[c]);
 
-      $display("[%0s] %0s: %0d cycles, %0.2f logged energy units.",
-               test_cases[c].name, (case_errors[c] == 0) ? "PASS" : "FAIL",
-               case_cycles[c], case_energy[c]);
-      $display("  SRAM words: A=%0d, B=%0d, C=%0d; SRAM energy=%0.0f.",
-               a_reads, b_reads, c_writes, case_sram_energy[c]);
+      begin
+        real peak_macs_per_cycle;
+        real mac_util_pct;
+        real time_util_pct;
+        real lane_util_pct;
+
+        peak_macs_per_cycle = real'(NumCores) * real'(NumInputs);
+        mac_util_pct = (case_cycles[c] > 0) ?
+                       (100.0 * real'(mac_active_lanes)) /
+                       (real'(case_cycles[c]) * peak_macs_per_cycle) : 0.0;
+        time_util_pct = (case_cycles[c] > 0) ?
+                        (100.0 * real'(mac_compute_cycles)) / real'(case_cycles[c]) : 0.0;
+        lane_util_pct = (mac_compute_cycles > 0) ?
+                        (100.0 * real'(mac_active_lanes)) /
+                        (real'(mac_compute_cycles) * peak_macs_per_cycle) : 0.0;
+        case_mac_util[c] = mac_util_pct;
+
+        $display("[%0s] %0s: %0d cycles, %0.2f logged energy units.",
+                 test_cases[c].name, (case_errors[c] == 0) ? "PASS" : "FAIL",
+                 case_cycles[c], case_energy[c]);
+        $display("  SRAM words: A=%0d, B=%0d, C=%0d; SRAM energy=%0.0f.",
+                 a_reads, b_reads, c_writes, case_sram_energy[c]);
+        $display("  MAC util: %0.2f%% overall (active time=%0.2f%%, spatial lanes=%0.2f%%).",
+                 mac_util_pct, time_util_pct, lane_util_pct);
+      end
 
       // Remain armed after done: no late accesses and no stretched done pulse.
       repeat (2) begin
@@ -494,38 +502,43 @@ module tb_mac_array_gemm;
   task automatic print_report();
     int unsigned num_failed;
     int unsigned workload_failures;
-    real normalized, normalized_sum;
+    real normalized, normalized_sum, mac_util_sum;
     num_failed = 0;
     workload_failures = 0;
     normalized_sum = 0.0;
+    mac_util_sum = 0.0;
 
-    $display("\n================================================================================================");
+    $display("\n=========================================================================================================");
     $display(" RESULTS -- first six rows are the required workloads; remaining rows are extra tests");
-    $display("------------------------------------------------------------------------------------------------");
-    $display(" %s | %4s %4s %3s | %8s | %12s | %12s | %12s | %s",
-             pad("Case", 14), "M", "K", "N", "Cycles", "Cycles/MKN", "Energy", "SRAM energy", "Check");
+    $display("---------------------------------------------------------------------------------------------------------");
+    $display(" %s | %4s %4s %3s | %8s | %12s | %10s | %12s | %12s | %s",
+             pad("Case", 14), "M", "K", "N", "Cycles", "Cycles/MKN", "MAC util %", "Energy", "SRAM energy", "Check");
     foreach (test_cases[c]) begin
       normalized = real'(case_cycles[c]) /
                    (real'(test_cases[c].M) * real'(test_cases[c].K) * real'(test_cases[c].N));
-      $display(" %s | %4d %4d %3d | %8d | %12.9f | %12.2f | %12.0f | %s",
+      $display(" %s | %4d %4d %3d | %8d | %12.9f | %9.2f%% | %12.2f | %12.0f | %s",
                pad(test_cases[c].name, 14), test_cases[c].M, test_cases[c].K, test_cases[c].N,
-               case_cycles[c], normalized, case_energy[c], case_sram_energy[c],
+               case_cycles[c], normalized, case_mac_util[c], case_energy[c], case_sram_energy[c],
                (case_errors[c] == 0) ? "PASS" : "FAIL");
       if (case_errors[c] != 0) num_failed++;
       if (c < NumWorkloads) begin
         normalized_sum += normalized;
+        mac_util_sum += case_mac_util[c];
         if (case_errors[c] != 0) workload_failures++;
       end
     end
-    $display("------------------------------------------------------------------------------------------------");
-    if (workload_failures == 0)
+    $display("---------------------------------------------------------------------------------------------------------");
+    if (workload_failures == 0) begin
       $display(" Mean normalized latency (ONLY six required workloads): %.9f cycles/MAC",
                normalized_sum / real'(NumWorkloads));
-    else
+      $display(" Mean MAC utilization (ONLY six required workloads): %0.2f%%",
+               mac_util_sum / real'(NumWorkloads));
+    end else begin
       $display(" Mean normalized latency: INVALID -- required workloads failed.");
+    end
     $display(" Logged area: %0.2f area units", metrics_pkg::area);
     $display(" Energy/area totals depend on the metric hooks implemented in the RTL modules.");
-    $display("================================================================================================\n");
+    $display("=========================================================================================================\n");
 
     if (num_failed != 0) $fatal(1, "%0d of %0d cases FAILED.", num_failed, NumCases);
     $display("All %0d cases passed!", NumCases);

@@ -1,2 +1,0 @@
-var g_data = ["","rtl/common/metrics_pkg.sv","tb/tb_mac_array_gemm.sv","includes/common_tasks.svh","rtl/common/single_port_memory.sv","rtl/gemm/gemm_accelerator_top_mac_array.sv","rtl/gemm/gemm_controller_mac_array.sv","rtl/common/ceiling_counter.sv","rtl/gemm/mac_array.sv","rtl/gemm/general_mac_pe.sv"];
-processSrcNamesData(g_data);

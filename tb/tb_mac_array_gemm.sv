@@ -130,7 +130,10 @@ module tb_mac_array_gemm;
 
  real             case_sram_energy [NumCases];
 
- real             case_mac_util [NumCases];
+ // Utilization values are percentages, stored separately for each case.
+ real             case_spatial_util [NumCases];
+ real             case_temporal_util [NumCases];
+ real             case_total_util [NumCases];
 
  int unsigned     case_errors [NumCases];
 
@@ -734,8 +737,9 @@ module tb_mac_array_gemm;
          $fatal(1, "[%0s] SRAM transaction after done.", test_cases[active_case].name);
 
        // Count cycles in which the DUT actually presents a valid MAC tile.
-       // This is a supporting timing statistic; spatial utilization is
-       // calculated independently from logical operation count / all slots.
+       // This count is the denominator for spatial utilization and the
+       // numerator for temporal utilization. Cycles without a valid MAC
+       // tile are not counted, even if other accelerator logic is active.
        if (!case_finished && i_dut.valid_data)
          mac_compute_cycles++;
 
@@ -904,11 +908,15 @@ module tb_mac_array_gemm;
 
        real useful_mac_operations;
 
-       real available_mac_slots;
+       real compute_mac_slots;
+
+       real total_mac_slots;
 
        real spatial_util_pct;
 
-       real active_time_pct;
+       real temporal_util_pct;
+
+       real total_util_pct;
 
        // Every logical output element requires K multiply-accumulate
        // operations. This counts only useful work and naturally excludes
@@ -919,17 +927,26 @@ module tb_mac_array_gemm;
                                real'(test_cases[c].K) *
                                real'(test_cases[c].N);
 
-       // The denominator includes EVERY elapsed cycle: SRAM loading,
-       // flushing, issuing, output draining/stalls, and compute cycles.
-       available_mac_slots = real'(case_cycles[c]) * peak_macs_per_cycle;
+       // Spatial: useful lanes during the cycles in which the array computes.
+       // Temporal: how often those compute cycles occur during the full job.
+       // Total: useful operations divided by all available MAC-cycle slots.
+       compute_mac_slots = real'(mac_compute_cycles) * peak_macs_per_cycle;
 
-       spatial_util_pct = (available_mac_slots > 0.0) ?
-                          (100.0 * useful_mac_operations) / available_mac_slots : 0.0;
+       total_mac_slots = real'(case_cycles[c]) * peak_macs_per_cycle;
 
-       active_time_pct = (case_cycles[c] > 0) ?
-                         (100.0 * real'(mac_compute_cycles)) / real'(case_cycles[c]) : 0.0;
+       spatial_util_pct = (compute_mac_slots > 0.0) ?
+                          (100.0 * useful_mac_operations) / compute_mac_slots : 0.0;
 
-       case_mac_util[c] = spatial_util_pct;
+       temporal_util_pct = (case_cycles[c] > 0) ?
+                           (100.0 * real'(mac_compute_cycles)) / real'(case_cycles[c]) : 0.0;
+
+       total_util_pct = (total_mac_slots > 0.0) ?
+                        (100.0 * useful_mac_operations) / total_mac_slots : 0.0;
+
+       // Per-case percentage relation: total = spatial * temporal / 100.
+       case_spatial_util[c] = spatial_util_pct;
+       case_temporal_util[c] = temporal_util_pct;
+       case_total_util[c] = total_util_pct;
 
        $display("[%0s] %0s: %0d cycles, %0.2f logged energy units.",
 
@@ -941,13 +958,17 @@ module tb_mac_array_gemm;
 
                 a_reads, b_reads, c_writes, case_sram_energy[c]);
 
-       $display("  Spatial utilization: %0.2f%% (useful MACs=%0.0f / available MAC slots=%0.0f).",
+       $display("  Spatial utilization:  %0.2f%% (useful MACs=%0.0f / compute MAC slots=%0.0f).",
 
-                spatial_util_pct, useful_mac_operations, available_mac_slots);
+                spatial_util_pct, useful_mac_operations, compute_mac_slots);
 
-       $display("  Active compute time: %0.2f%% (%0d valid compute cycles / %0d total cycles).",
+       $display("  Temporal utilization: %0.2f%% (%0d valid compute cycles / %0d total cycles).",
 
-                active_time_pct, mac_compute_cycles, case_cycles[c]);
+                temporal_util_pct, mac_compute_cycles, case_cycles[c]);
+
+       $display("  Total utilization:    %0.2f%% (useful MACs=%0.0f / total MAC slots=%0.0f).",
+
+                total_util_pct, useful_mac_operations, total_mac_slots);
 
      end
 
@@ -1006,7 +1027,8 @@ module tb_mac_array_gemm;
 
    int unsigned workload_failures;
 
-   real normalized, normalized_sum, mac_util_sum;
+   real normalized, normalized_sum;
+   real spatial_util_sum, temporal_util_sum, total_util_sum;
 
    num_failed = 0;
 
@@ -1014,17 +1036,20 @@ module tb_mac_array_gemm;
 
    normalized_sum = 0.0;
 
-   mac_util_sum = 0.0;
+   spatial_util_sum = 0.0;
+   temporal_util_sum = 0.0;
+   total_util_sum = 0.0;
 
-   $display("\n=========================================================================================================");
+   $display("\n===========================================================================================================================================");
 
    $display(" RESULTS -- first six rows are the required workloads; remaining rows are extra tests");
 
-   $display("---------------------------------------------------------------------------------------------------------");
+   $display("-------------------------------------------------------------------------------------------------------------------------------------------");
 
-   $display(" %s | %4s %4s %3s | %8s | %12s | %10s | %12s | %12s | %s",
+   $display(" %s | %4s %4s %3s | %8s | %12s | %8s | %9s | %8s | %12s | %12s | %s",
 
-            pad("Case", 14), "M", "K", "N", "Cycles", "Cycles/MKN", "MAC util *%*", "Energy", "SRAM energy", "Check");
+            pad("Case", 14), "M", "K", "N", "Cycles", "Cycles/MKN",
+            "Spatial", "Temporal", "Total", "Energy", "SRAM energy", "Check");
 
    foreach (test_cases[c]) begin
 
@@ -1032,11 +1057,12 @@ module tb_mac_array_gemm;
 
                   (real'(test_cases[c].M) * real'(test_cases[c].K) * real'(test_cases[c].N));
 
-     $display(" %s | %4d %4d %3d | %8d | %12.9f | %9.2f%% | %12.2f | %12.0f | %s",
+     $display(" %s | %4d %4d %3d | %8d | %12.9f | %7.2f%% | %8.2f%% | %7.2f%% | %12.2f | %12.0f | %s",
 
               pad(test_cases[c].name, 14), test_cases[c].M, test_cases[c].K, test_cases[c].N,
 
-              case_cycles[c], normalized, case_mac_util[c], case_energy[c], case_sram_energy[c],
+              case_cycles[c], normalized, case_spatial_util[c], case_temporal_util[c],
+              case_total_util[c], case_energy[c], case_sram_energy[c],
 
               (case_errors[c] == 0) ? "PASS" : "FAIL");
 
@@ -1046,7 +1072,11 @@ module tb_mac_array_gemm;
 
        normalized_sum += normalized;
 
-       mac_util_sum += case_mac_util[c];
+       // Arithmetic means over the required workloads, computed separately.
+       // The mean total is not generally the product of the other two means.
+       spatial_util_sum += case_spatial_util[c];
+       temporal_util_sum += case_temporal_util[c];
+       total_util_sum += case_total_util[c];
 
        if (case_errors[c] != 0) workload_failures++;
 
@@ -1054,7 +1084,7 @@ module tb_mac_array_gemm;
 
    end
 
-   $display("---------------------------------------------------------------------------------------------------------");
+   $display("-------------------------------------------------------------------------------------------------------------------------------------------");
 
    if (workload_failures == 0) begin
 
@@ -1062,9 +1092,17 @@ module tb_mac_array_gemm;
 
               normalized_sum / real'(NumWorkloads));
 
-     $display(" Mean MAC utilization (ONLY six required workloads): %0.2f%%",
+     $display(" Mean spatial utilization  (ONLY six required workloads): %0.2f%%",
 
-              mac_util_sum / real'(NumWorkloads));
+              spatial_util_sum / real'(NumWorkloads));
+
+     $display(" Mean temporal utilization (ONLY six required workloads): %0.2f%%",
+
+              temporal_util_sum / real'(NumWorkloads));
+
+     $display(" Mean total utilization    (ONLY six required workloads): %0.2f%%",
+
+              total_util_sum / real'(NumWorkloads));
 
    end else begin
 
@@ -1076,7 +1114,7 @@ module tb_mac_array_gemm;
 
    $display(" Energy/area totals depend on the metric hooks implemented in the RTL modules.");
 
-   $display("=========================================================================================================\n");
+   $display("===========================================================================================================================================\n");
 
    if (num_failed != 0) $fatal(1, "%0d of %0d cases FAILED.", num_failed, NumCases);
 

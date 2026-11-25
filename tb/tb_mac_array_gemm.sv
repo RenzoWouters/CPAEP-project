@@ -4,7 +4,7 @@
 // Each physical read OR write consumes its complete 128-bit bank word.
 // Phase 1: all matrix jobs, including all six random-data reruns, without reset.
 // Phase 2: directed abort/reset/restart tests on the SAME DUT and memories.
-// Phase 3: post-report SRAM port/toggle tests using legal read OR write cycles.
+// Phase 3: post-report SRAM checks, including an explicit protocol-negative test.
 // Logical row-major golden matrices are independent of the banked layout.
 //-----------------------------------------------------------------------------
 module tb_mac_array_gemm;
@@ -186,6 +186,8 @@ module tb_mac_array_gemm;
 
   // SRAM coverage controls stay inactive throughout the matrix/reset tests.
   logic sram_tb_override;
+  logic sram_negative_active;
+  int unsigned sram_negative_cycles;
   logic [NumBanks-1:0][AddrWidth-1:0] tb_bank_addr;
   logic [NumBanks-1:0] tb_bank_re, tb_bank_we;
   logic [NumBanks-1:0][BankDataWidth-1:0] tb_bank_wdata;
@@ -877,8 +879,9 @@ module tb_mac_array_gemm;
 
   //---------------------------------------------------------------------------
   // Phase 3: SRAM coverage after the complete accelerator performance report.
-  // No simultaneous read/write stimulus: it is forbidden by the project and
-  // deliberately rejected by the unchanged SRAM module's $error check.
+  // Normal accesses remain half-duplex. One explicitly marked negative cycle
+  // exercises the unchanged SRAM module's simultaneous read/write $error check.
+  // scripts/check_sram_negative_log.py checks the eight expected diagnostics.
   //---------------------------------------------------------------------------
   always @(posedge clk_i) begin : monitor_sram_override
     int unsigned active_banks;
@@ -889,9 +892,17 @@ module tb_mac_array_gemm;
         $fatal(1, "SRAM test override overlaps accelerator activity.");
       if ($isunknown({tb_bank_re, tb_bank_we}))
         $fatal(1, "Unknown SRAM test enables.");
+      if (sram_negative_active) begin
+        if (rst_ni !== 1'b1 || tb_bank_re !== '1 || tb_bank_we !== '1 ||
+            tb_bank_addr !== '0)
+          $fatal(1, "Malformed SRAM negative-test stimulus.");
+        sram_negative_cycles++;
+        if (sram_negative_cycles != 1)
+          $fatal(1, "SRAM negative test lasted more than one clock cycle.");
+      end
       active_banks = 0;
       for (int b = 0; b < NumBanks; b++) begin
-        if (tb_bank_re[b] && tb_bank_we[b])
+        if (tb_bank_re[b] && tb_bank_we[b] && !sram_negative_active)
           $fatal(1, "SRAM test bank %0d reads and writes in the same cycle.", b);
         if (tb_bank_re[b] || tb_bank_we[b]) begin
           active_banks++;
@@ -988,7 +999,28 @@ module tb_mac_array_gemm;
       check_sram_read_data(pat, $sformatf("hold pattern %0d", step));
     end
 
-    // Prepare an all-ones read output with separate write and read cycles.
+    // Negative test: exactly one active edge with RE=WE=1 on every bank.
+    // These are testbench-generated invalid requests, never accelerator traffic.
+    // Do not suppress or modify the SRAM $errors: the log checker must observe
+    // exactly one original error from each bank, and no unrelated errors.
+    @(negedge clk_i);
+    sram_negative_active = 1'b1;
+    tb_bank_addr = '0;
+    tb_bank_wdata = '1;
+    tb_bank_re = '1;
+    tb_bank_we = '1;
+    $display("[SRAM NEGATIVE BEGIN] expected_errors=%0d address=0", NumBanks);
+    @(posedge clk_i); #1;
+    if (sram_negative_cycles != 1)
+      $fatal(1, "SRAM negative-test cycle was not observed.");
+    @(negedge clk_i);
+    tb_bank_re = '0;
+    tb_bank_we = '0;
+    sram_negative_active = 1'b0;
+    $display("[SRAM NEGATIVE END] cycles=%0d", sram_negative_cycles);
+
+    // Re-establish known contents using legal cycles; do not assume any
+    // defined read-during-write behavior from the invalid negative cycle.
     @(negedge clk_i);
     tb_bank_addr = '0;
     tb_bank_wdata = '1;
@@ -1025,7 +1057,7 @@ module tb_mac_array_gemm;
     @(posedge clk_i); #1;
     check_reset_idle("after SRAM coverage exercise");
     $display("[SRAM COV] PASS: all %0d banks passed read/write, latency, hold and reset checks.", NumBanks);
-    $display("[SRAM COV] Only legal read OR write cycles used; no error-branch stimulus.");
+    $display("[SRAM NEGATIVE] Stimulus completed; expected-error log check required.");
   endtask
 
   function automatic string pad(input string str,input int unsigned width);
@@ -1108,6 +1140,7 @@ module tb_mac_array_gemm;
       $fatal(1,"Regression requires12-bit dimensions and a cache allowing the large-K fallback test.");
     start=0;rst_ni=0;M_i='0;K_i='0;N_i='0;monitor_active=0;case_finished=0;
     sram_tb_override=0;tb_bank_addr='0;tb_bank_re='0;tb_bank_we='0;tb_bank_wdata='0;
+    sram_negative_active=0;sram_negative_cycles=0;
     active_case_name="startup";expect_reset_quiet=0;reset_cases_passed=0;
     queue_observation_active=1;check_queue_update=0;queue_head_wraps=0;queue_tail_wraps=0;queue_full_replacements=0;
     paired_c_writes=0;gemv_c_pause_events=0;bank_direction_switches=0;
@@ -1167,6 +1200,7 @@ module tb_mac_array_gemm;
     $display("Mode x K cross:   %0.2f%%",coverage.mode_k_cross.get_coverage());
     $display("==========================================");
     $display("All %0d matrix cases and %0d reset/restart tests passed!",NumCases,reset_cases_passed);
+    $display("[REGRESSION COMPLETE] matrix_cases=%0d reset_tests=%0d sram_positive=PASS negative_stimulus=COMPLETE",NumCases,reset_cases_passed);
     $finish;
   end
 endmodule

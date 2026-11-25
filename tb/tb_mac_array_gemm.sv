@@ -10,6 +10,7 @@
 // compare the new GeMM reuse schedule against the preserved original run.
 // C packs two int32 results per 64-bit word by default; GeMM rows are padded
 // independently, while GeMV packs consecutive M results into complete words.
+// GeMV flush/ISSUE overlap is compared with the saved C64/MReuse8 run.
 // Phase 1: one initial reset, then all matrix cases without a DUT reset.
 // Phase 2: directed reset/abort/restart tests on the same DUT and SRAMs.
 // Both phases contribute to the same simulation's code coverage.
@@ -92,7 +93,7 @@ module tb_mac_array_gemm;
 
  localparam int unsigned NumWorkloads = 6;
 
- localparam int unsigned NumCases     = 41;
+ localparam int unsigned NumCases     = 42;
 
  // Measured in Performance evolution/iteration1.txt, before M-row reuse.
  // This is a comparison reference, not a performance assertion or new run.
@@ -108,6 +109,12 @@ module tb_mac_array_gemm;
  localparam int unsigned PreviousC32Cycles [NumWorkloads] =
    '{2077, 2105, 8129, 17300, 61460, 112660};
  localparam bit HasComparableC32Reference = HasComparableBaseline && (MReuse == 4);
+ // User-confirmed C64/MReuse8 run before GeMV flush/ISSUE overlap.
+ // These are measured comparison values, not expected results for this run.
+ localparam int unsigned PreviousC64MReuse8Cycles [NumWorkloads] =
+   '{1059, 1277, 5533, 17292, 61452, 112652};
+ localparam bit HasMatchingC64MReuse8Reference = HasComparableBaseline &&
+   (MReuse == 8) && (SramBDataWidth == 448) && (SramCDataWidth == 64);
 
  typedef enum int unsigned {
    ResetTopStart,
@@ -186,7 +193,11 @@ module tb_mac_array_gemm;
                       NumInputs+1, NumCores+1, 0},
    '{"Reuse exact", MReuse, NumInputs, 2*NumCores, 0},
    '{"Reuse above", MReuse+1, 2*NumInputs, NumCores, 0},
-   '{"Reuse multi tails", 2*MReuse+1, 2*NumInputs+1, 2*NumCores+1, 0}
+   '{"Reuse multi tails", 2*MReuse+1, 2*NumInputs+1, 2*NumCores+1, 0},
+
+   // Every K block finishes an output group; the final M group is partial.
+   // This exercises successive initialized results with the merged GeMV ISSUE.
+   '{"GeMV consecutive", 2*NumCores+1, NumInputs, 1, 0}
  };
 
  int unsigned     case_cycles [NumCases];
@@ -870,7 +881,7 @@ module tb_mac_array_gemm;
      ResetTopStart:        return "TopStart";
      ResetDuringLoad:      return "mid-load after first K block";
      ResetTopFlush:        return "TopFlush";
-     ResetTopIssue:        return "TopIssue of second K block";
+     ResetTopIssue:        return "ISSUE of second K block";
      ResetControllerDrain: return "ControllerDrain";
      ResetDuringCWrite:    return "partial C write in TopDrain";
      default:             return "unknown reset target";
@@ -888,7 +899,7 @@ module tb_mac_array_gemm;
      ResetTopFlush:
        return (i_dut.state_q === i_dut.TopFlush);
      ResetTopIssue:
-       return (i_dut.state_q === i_dut.TopIssue) &&
+       return (i_dut.issue_block === 1'b1) &&
               (i_dut.K_count == NumInputs) && (mac_compute_cycles > 0);
      ResetControllerDrain:
        return (i_dut.state_q === i_dut.TopDrain) &&
@@ -1439,6 +1450,71 @@ module tb_mac_array_gemm;
 
  endfunction
 
+ // Compare all five requested metrics for each of the six required workloads.
+ // The saved reference uses all 512 lanes on every accepted compute cycle,
+ // so its spatial utilization is 100% and temporal equals total utilization.
+ task automatic print_c64_mreuse8_comparison();
+   real operations, reference_normalized, current_normalized, reference_util;
+   real reference_normalized_sum, current_normalized_sum, reference_util_sum;
+   real current_spatial_sum, current_temporal_sum, current_total_sum;
+
+   if (!HasMatchingC64MReuse8Reference) begin
+     $display(" C64/MReuse8 comparison omitted: hardware parameters differ from the saved reference.");
+     return;
+   end
+   for (int unsigned c = 0; c < NumWorkloads; c++) begin
+     if (case_errors[c] != 0) begin
+       $display(" C64/MReuse8 comparison INVALID: a required workload failed.");
+       return;
+     end
+   end
+
+   reference_normalized_sum = 0.0;
+   current_normalized_sum = 0.0;
+   reference_util_sum = 0.0;
+   current_spatial_sum = 0.0;
+   current_temporal_sum = 0.0;
+   current_total_sum = 0.0;
+
+   $display("\n COMPARISON -- saved C64/MReuse8 reference versus current run");
+   $display(" Reference: A/B/C=512/448/64 bits, MReuse=8, before GeMV flush/ISSUE overlap.");
+   $display(" %s | %10s | %10s | %16s | %16s",
+            pad("Case", 14), "Cycles ref", "Cycles now", "Cycles/MKN ref", "Cycles/MKN now");
+   for (int unsigned c = 0; c < NumWorkloads; c++) begin
+     operations = real'(test_cases[c].M) * real'(test_cases[c].K) * real'(test_cases[c].N);
+     reference_normalized = real'(PreviousC64MReuse8Cycles[c]) / operations;
+     current_normalized = real'(case_cycles[c]) / operations;
+     reference_normalized_sum += reference_normalized;
+     current_normalized_sum += current_normalized;
+     $display(" %s | %10d | %10d | %16.9f | %16.9f",
+              pad(test_cases[c].name, 14), PreviousC64MReuse8Cycles[c], case_cycles[c],
+              reference_normalized, current_normalized);
+   end
+
+   $display(" %s | %11s | %11s | %11s | %11s | %11s | %11s",
+            pad("Case", 14), "Spatial ref", "Spatial now", "Temp. ref", "Temp. now", "Total ref", "Total now");
+   for (int unsigned c = 0; c < NumWorkloads; c++) begin
+     operations = real'(test_cases[c].M) * real'(test_cases[c].K) * real'(test_cases[c].N);
+     reference_util = 100.0 * operations / (512.0 * real'(PreviousC64MReuse8Cycles[c]));
+     reference_util_sum += reference_util;
+     current_spatial_sum += case_spatial_util[c];
+     current_temporal_sum += case_temporal_util[c];
+     current_total_sum += case_total_util[c];
+     $display(" %s | %10.2f%% | %10.2f%% | %10.2f%% | %10.2f%% | %10.2f%% | %10.2f%%",
+              pad(test_cases[c].name, 14), 100.0, case_spatial_util[c],
+              reference_util, case_temporal_util[c], reference_util, case_total_util[c]);
+   end
+   $display(" %s | %10.2f%% | %10.2f%% | %10.2f%% | %10.2f%% | %10.2f%% | %10.2f%%",
+            pad("Mean", 14), 100.0, current_spatial_sum / real'(NumWorkloads),
+            reference_util_sum / real'(NumWorkloads), current_temporal_sum / real'(NumWorkloads),
+            reference_util_sum / real'(NumWorkloads), current_total_sum / real'(NumWorkloads));
+   $display(" C64/MReuse8 mean normalized latency: reference=%.9f, current=%.9f cycles/MAC.",
+            reference_normalized_sum / real'(NumWorkloads),
+            current_normalized_sum / real'(NumWorkloads));
+   $display(" Measured reduction versus saved C64/MReuse8: %0.2f%% (positive is better).",
+            100.0 * (1.0 - current_normalized_sum / reference_normalized_sum));
+ endtask
+
  task automatic print_report();
 
    int unsigned num_failed;
@@ -1534,6 +1610,8 @@ module tb_mac_array_gemm;
      $display(" Mean normalized latency: INVALID -- required workloads failed.");
 
    end
+
+   print_c64_mreuse8_comparison();
 
    $display("\n REUSE / OUTPUT-BANDWIDTH DIAGNOSTICS -- six required workloads");
    $display(" %s | %10s | %10s | %10s | %10s | %10s",

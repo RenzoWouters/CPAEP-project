@@ -7,7 +7,9 @@
 // One B tile is reused by up to MReuse rows. Each row has its own A-word cache
 // and accumulator context. A bounded output FIFO includes reservations for
 // results still in the MAC pipeline; C writes overlap following computation.
-// GeMV retains the original 16 M rows x 32 K lanes mapping and burst schedule.
+// GeMV keeps the 16 M rows x 32 K lanes mapping. Its last SRAM response and
+// ISSUE share TopFlush; the MAC consumes the completed buffer one edge later.
+// With the default A port, this takes 8 read cycles + 1 flush/issue cycle.
 //
 // Layout (byte lane 0 is the least-significant byte):
 //   GeMM A: row-major, each row padded to 64-element words.
@@ -84,7 +86,7 @@ module gemm_accelerator_top_mac_array #(
   logic [CountWidth-1:0] M_count, K_count, N_count;
   logic is_gemv, controller_busy, controller_done;
   logic valid_data, init_save, result_valid;
-  logic start_controller, issue_block, accept_start;
+  logic start_controller, issue_phase, issue_block, accept_start;
   logic controller_done_seen_q, done_q;
   logic [BeatWidth-1:0] read_beat_q;
   logic last_read, last_k_block, last_job_block, last_reuse_row;
@@ -146,9 +148,13 @@ module gemm_accelerator_top_mac_array #(
   assign accept_start = (state_q == TopIdle) && start_i;
   assign start_controller = (state_q == TopStart);
   assign output_slot_busy_q = (output_queue_used_q == QueueCountWidth'(QueueDepth));
-  assign output_stall = (state_q == TopIssue) && last_k_block &&
+  // GeMV may issue while capturing the last synchronous SRAM response:
+  // valid_data and MAC metadata are registered, so consumption is next edge.
+  // Apply the same output reservation/backpressure rules in both issue phases.
+  assign issue_phase = (state_q == TopIssue) || (is_gemv && (state_q == TopFlush));
+  assign output_stall = issue_phase && last_k_block &&
                         output_slot_busy_q && !last_c_write;
-  assign issue_block = (state_q == TopIssue) && !output_stall;
+  assign issue_block = issue_phase && !output_stall;
   assign reserve_output = issue_block && last_k_block;
   assign done_o = done_q;
 
@@ -256,8 +262,18 @@ module gemm_accelerator_top_mac_array #(
           read_beat_q <= '0;
           state_q <= TopFlush;
         end else read_beat_q <= read_beat_q + BeatWidth'(1);
-        // Capture the final synchronous SRAM response before any row is issued.
-        TopFlush: state_q <= TopIssue;
+        TopFlush: begin
+          if (is_gemv) begin
+            // The final operand word is captured on this edge. The following
+            // edge consumes the complete tile and may request the next tile's
+            // first word; that response cannot overwrite the old tile earlier.
+            // Stay here if the last-K result cannot reserve an output slot yet.
+            if (issue_block) begin
+              if (last_job_block) state_q <= TopDrain;
+              else state_q <= TopLoad;
+            end
+          end else state_q <= TopIssue;
+        end
         TopIssue: if (issue_block) begin
           if (last_job_block) state_q <= TopDrain;
           else if (last_reuse_row) state_q <= TopLoad;

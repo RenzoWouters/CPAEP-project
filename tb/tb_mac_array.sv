@@ -16,7 +16,7 @@ module tb_mac_array;
   parameter int unsigned NumInputs    = 32;
   parameter int unsigned OutDataWidth = 32;
   // Run with NumContexts=1 for the original PE, and 4/8 for row reuse.
-  parameter int unsigned NumContexts  = 1;
+  parameter int unsigned NumContexts  = 32;
   localparam int unsigned ContextWidth = (NumContexts <= 1) ? 1 : $clog2(NumContexts);
 
   //---------------------------

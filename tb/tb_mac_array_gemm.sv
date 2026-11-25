@@ -8,6 +8,8 @@
 // Additional random-data runs cover all six required workload dimensions.
 // MReuse row-bank boundaries, exact B-traffic checks and C-backpressure metrics
 // compare the new GeMM reuse schedule against the preserved original run.
+// C packs two int32 results per 64-bit word by default; GeMM rows are padded
+// independently, while GeMV packs consecutive M results into complete words.
 // Phase 1: one initial reset, then all matrix cases without a DUT reset.
 // Phase 2: directed reset/abort/restart tests on the same DUT and SRAMs.
 // Both phases contribute to the same simulation's code coverage.
@@ -38,7 +40,9 @@ module tb_mac_array_gemm;
 
  parameter int unsigned SramADataWidth = 512;
 
- parameter int unsigned SramBDataWidth = 480;
+ parameter int unsigned SramBDataWidth = 448;
+
+ parameter int unsigned SramCDataWidth = 64;
 
  parameter int unsigned DataDepthA     = 131072;
 
@@ -55,6 +59,8 @@ module tb_mac_array_gemm;
  localparam int unsigned AElements = SramADataWidth / InDataWidth;
 
  localparam int unsigned BElements = SramBDataWidth / InDataWidth;
+
+ localparam int unsigned CElements = SramCDataWidth / OutDataWidth;
 
  localparam int unsigned TileElements = NumCores * NumInputs;
 
@@ -92,10 +98,16 @@ module tb_mac_array_gemm;
  // This is a comparison reference, not a performance assertion or new run.
  localparam int unsigned BaselineCycles [NumWorkloads] =
    '{2836, 5652, 25364, 17300, 61460, 112660};
- localparam bit HasMatchingBaseline =
+ // Port widths deliberately change in this experiment. These references
+ // compare the same required workloads and arithmetic/array dimensions.
+ localparam bit HasComparableBaseline =
    (NumCores == 16) && (NumInputs == 32) &&
    (InDataWidth == 8) && (OutDataWidth == 32) &&
-   (SramADataWidth == 512) && (SramBDataWidth == 480);
+   (SramADataWidth == 512);
+ // Previous measured MReuse=4 design, with A/B/C=512/480/32 bits.
+ localparam int unsigned PreviousC32Cycles [NumWorkloads] =
+   '{2077, 2105, 8129, 17300, 61460, 112660};
+ localparam bit HasComparableC32Reference = HasComparableBaseline && (MReuse == 4);
 
  typedef enum int unsigned {
    ResetTopStart,
@@ -217,7 +229,7 @@ module tb_mac_array_gemm;
 
  logic [SramBDataWidth-1:0] sram_b_rdata;
 
- logic signed [OutDataWidth-1:0] sram_c_wdata;
+ logic [SramCDataWidth-1:0] sram_c_wdata;
 
  // Logical row-major matrices, independent of the packed SRAM layout.
 
@@ -343,7 +355,7 @@ module tb_mac_array_gemm;
 
  single_port_memory #(
 
-   .DataWidth (OutDataWidth),
+   .DataWidth (SramCDataWidth),
 
    .DataDepth (DataDepthC),
 
@@ -373,7 +385,9 @@ module tb_mac_array_gemm;
 
    .NumCores(NumCores), .NumInputs(NumInputs), .MReuse(MReuse),
 
-   .SramADataWidth(SramADataWidth), .SramBDataWidth(SramBDataWidth)
+   .SramADataWidth(SramADataWidth), .SramBDataWidth(SramBDataWidth),
+
+   .SramCDataWidth(SramCDataWidth)
 
  ) i_dut (
 
@@ -467,7 +481,10 @@ module tb_mac_array_gemm;
 
    end
 
-   c_used_words = m_sz * n_sz;
+   // GeMM: every row starts at a word boundary, with zero padding at its end.
+   // GeMV: one packed vector, with padding only after the final M result.
+   c_used_words = (n_sz == 1) ? ((m_sz + CElements - 1) / CElements) :
+                   (m_sz * ((n_sz + CElements - 1) / CElements));
 
    if (a_used_words > DataDepthA || b_used_words > DataDepthB || c_used_words > DataDepthC)
 
@@ -487,7 +504,7 @@ module tb_mac_array_gemm;
 
    B_ref = new[k_sz*n_sz];
 
-   G_memory = new[c_used_words];
+   G_memory = new[m_sz*n_sz];
 
    c_written = new[c_used_words]; // bit array: initially all zero.
 
@@ -777,28 +794,45 @@ module tb_mac_array_gemm;
 
  task automatic verify_result_c(output int unsigned num_errors);
 
+   int unsigned c_words_per_row, row, column, logical_index;
+   bit is_padding;
+   logic signed [OutDataWidth-1:0] expected_value, actual_value;
+
    num_errors = 0;
+   c_words_per_row = (int'(N_i) + CElements - 1) / CElements;
 
    for (int unsigned addr = 0; addr < c_used_words; addr++) begin
 
      if (!c_written[addr]) begin
 
-       if (num_errors < 10) $display("ERROR: C[%0d] was not written.", addr);
+       if (num_errors < 10) $display("ERROR: C word %0d was not written.", addr);
 
        num_errors++;
 
-     end else if (G_memory[addr] !== i_sram_c.memory[addr]) begin
-
-       if (num_errors < 10)
-
-         $display("ERROR: C[%0d]: expected %0d (0x%08h), got %0d (0x%08h).",
-
-                  addr, $signed(G_memory[addr]), G_memory[addr],
-
-                  $signed(i_sram_c.memory[addr]), i_sram_c.memory[addr]);
-
-       num_errors++;
-
+     end else begin
+       // Decode physical C words independently of DUT counters/FIFO metadata.
+       // Check every int32 lane, including deterministic zero padding.
+       for (int unsigned lane = 0; lane < CElements; lane++) begin
+         if (N_i == 1) begin
+           logical_index = addr * CElements + lane;
+           is_padding = (logical_index >= int'(M_i));
+         end else begin
+           row = addr / c_words_per_row;
+           column = (addr % c_words_per_row) * CElements + lane;
+           logical_index = row * int'(N_i) + column;
+           is_padding = (column >= int'(N_i));
+         end
+         if (is_padding) expected_value = '0;
+         else expected_value = G_memory[logical_index];
+         actual_value = $signed(i_sram_c.memory[addr][lane*OutDataWidth +: OutDataWidth]);
+         if (expected_value !== actual_value) begin
+           if (num_errors < 10)
+             $display("ERROR: C word %0d lane %0d (%0s): expected %0d (0x%08h), got %0d (0x%08h).",
+                      addr, lane, is_padding ? "padding" : "result",
+                      expected_value, expected_value, actual_value, actual_value);
+           num_errors++;
+         end
+       end
      end
 
    end
@@ -909,7 +943,7 @@ module tb_mac_array_gemm;
    int unsigned recovery_cycles, recovery_errors;
    real recovery_energy;
    string reset_label;
-   logic signed [OutDataWidth-1:0] c_snapshot[];
+   logic [SramCDataWidth-1:0] c_snapshot[];
 
    reset_label = $sformatf("%0s / %0s",
                          abort_is_gemv ? "GeMV" : "GeMM",
@@ -1209,7 +1243,9 @@ module tb_mac_array_gemm;
 
    $display("Random seed: 0x%08h", RandomSeed);
    $display("GeMM MReuse=%0d; fixed SRAM widths A/B/C=%0d/%0d/%0d bits.",
-            MReuse, SramADataWidth, SramBDataWidth, OutDataWidth);
+            MReuse, SramADataWidth, SramBDataWidth, SramCDataWidth);
+   $display("C packing: %0d int32 results/word; GeMM row padding and GeMV final padding are zero.",
+            CElements);
    $display("PHASE 1: %0d matrix cases without an intermediate DUT reset.", NumCases);
 
    foreach (test_cases[c]) begin
@@ -1256,7 +1292,7 @@ module tb_mac_array_gemm;
 
                                   real'(b_reads) * SramBDataWidth +
 
-                                  real'(c_writes) * OutDataWidth);
+                                  real'(c_writes) * SramCDataWidth);
 
      verify_result_c(case_errors[c]);
 
@@ -1316,14 +1352,17 @@ module tb_mac_array_gemm;
 
                 a_reads, b_reads, c_writes, case_sram_energy[c]);
 
-       $display("  B traffic: %0d words versus %0d without M-row reuse (%0.2fx fewer reads).",
+       $display("  B traffic: %0d words versus %0d without M-row reuse at the current B width (%0.2fx fewer reads).",
                 b_reads, expected_b_reads(M_i, K_i, N_i, 1),
                 (b_reads != 0) ? real'(expected_b_reads(M_i, K_i, N_i, 1)) / real'(b_reads) : 0.0);
        $display("  C backpressure: %0d blocked issue cycles; peak output groups reserved=%0d/%0d.",
                 output_stall_cycles, output_queue_peak, MReuse);
-       if ((c < NumWorkloads) && HasMatchingBaseline)
+       if ((c < NumWorkloads) && HasComparableBaseline)
          $display("  Original latency=%0d cycles; measured speedup=%0.3fx.",
                   BaselineCycles[c], real'(BaselineCycles[c]) / real'(case_cycles[c]));
+       if ((c < NumWorkloads) && HasComparableC32Reference)
+         $display("  Previous C32/MReuse4 latency=%0d cycles; measured speedup=%0.3fx.",
+                  PreviousC32Cycles[c], real'(PreviousC32Cycles[c]) / real'(case_cycles[c]));
 
        $display("  Spatial utilization:  %0.2f%% (useful MACs=%0.0f / compute MAC slots=%0.0f).",
 
@@ -1408,7 +1447,7 @@ module tb_mac_array_gemm;
 
    real normalized, normalized_sum;
    real spatial_util_sum, temporal_util_sum, total_util_sum;
-   real baseline_normalized_sum;
+   real baseline_normalized_sum, previous_c32_normalized_sum;
 
    num_failed = 0;
 
@@ -1416,6 +1455,7 @@ module tb_mac_array_gemm;
 
    normalized_sum = 0.0;
    baseline_normalized_sum = 0.0;
+   previous_c32_normalized_sum = 0.0;
 
    spatial_util_sum = 0.0;
    temporal_util_sum = 0.0;
@@ -1453,6 +1493,8 @@ module tb_mac_array_gemm;
 
        normalized_sum += normalized;
        baseline_normalized_sum += real'(BaselineCycles[c]) /
+         (real'(test_cases[c].M) * real'(test_cases[c].K) * real'(test_cases[c].N));
+       previous_c32_normalized_sum += real'(PreviousC32Cycles[c]) /
          (real'(test_cases[c].M) * real'(test_cases[c].K) * real'(test_cases[c].N));
 
        // Arithmetic means over the required workloads, computed separately.
@@ -1495,20 +1537,26 @@ module tb_mac_array_gemm;
 
    $display("\n REUSE / OUTPUT-BANDWIDTH DIAGNOSTICS -- six required workloads");
    $display(" %s | %10s | %10s | %10s | %10s | %10s",
-            pad("Case", 14), "B old", "B measured", "C writes", "C stalls", "Queue peak");
+            pad("Case", 14), "B no reuse", "B measured", "C writes", "C stalls", "Queue peak");
    for (int unsigned c = 0; c < NumWorkloads; c++) begin
      $display(" %s | %10d | %10d | %10d | %10d | %10d",
               pad(test_cases[c].name, 14),
               expected_b_reads(test_cases[c].M, test_cases[c].K, test_cases[c].N, 1),
               case_b_reads[c], case_c_writes[c], case_output_stalls[c], case_queue_peak[c]);
    end
-   if (HasMatchingBaseline && (workload_failures == 0)) begin
+   if (HasComparableBaseline && (workload_failures == 0)) begin
      $display(" Original mean normalized latency: %.9f cycles/MAC.",
               baseline_normalized_sum / real'(NumWorkloads));
      $display(" Measured reduction in mean normalized latency: %0.2f%% (positive is better).",
               100.0 * (1.0 - normalized_sum / baseline_normalized_sum));
-   end else if (!HasMatchingBaseline) begin
-     $display(" Original latency comparison omitted: hardware parameters differ from the saved reference.");
+   end else if (!HasComparableBaseline) begin
+     $display(" Original latency comparison omitted: array/arithmetic/A-port parameters differ from the saved reference.");
+   end
+   if (HasComparableC32Reference && (workload_failures == 0)) begin
+     $display(" Previous C32/MReuse4 mean normalized latency: %.9f cycles/MAC (A/B/C=512/480/32).",
+              previous_c32_normalized_sum / real'(NumWorkloads));
+     $display(" Measured reduction versus previous C32/MReuse4: %0.2f%% (positive is better).",
+              100.0 * (1.0 - normalized_sum / previous_c32_normalized_sum));
    end
 
    $display(" Logged area: %0.2f area units", metrics_pkg::area);

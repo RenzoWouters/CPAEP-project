@@ -1,8 +1,8 @@
 //-----------------------------------------------------------------------------
 // GeMM / GeMV top: 16 dot-product cores x 32 K lanes = 512 MAC lanes.
 //
-// Fixed external SRAM words: A=512 bits, B=480 bits, C=32 bits by default.
-// The supplied one-cycle synchronous SRAM behavior and word layouts are kept.
+// Fixed external SRAM words: A=512 bits, B=448 bits, C=64 bits by default.
+// The supplied one-cycle synchronous SRAM behavior is kept.
 // GeMM loop order: [M group][N group][K block][row within M group].
 // One B tile is reused by up to MReuse rows. Each row has its own A-word cache
 // and accumulator context. A bounded output FIFO includes reservations for
@@ -12,10 +12,12 @@
 // Layout (byte lane 0 is the least-significant byte):
 //   GeMM A: row-major, each row padded to 64-element words.
 //   GeMV A: [M group][K block][core][K lane], 8 words per 16x32 tile.
-//   GeMM B: [N group][K block][core][K lane], 9 words per 16x32 tile;
-//           the last 60-byte word contains 32 useful bytes and 28 padding bytes.
-//   GeMV B: one 60-byte word per K block; first 32 bytes contain the vector.
-//   C:      scalar int32, row-major, one result per SRAM word.
+//   GeMM B: [N group][K block][core][K lane], 10 words per 16x32 tile;
+//           the last 56-byte word contains 8 useful bytes and 48 padding bytes.
+//   GeMV B: one 56-byte word per K block; first 32 bytes contain the vector.
+//   GeMM C: row-major int32, each row padded to a whole SRAM C word.
+//   GeMV C: consecutive int32 results, padded only at the end of the vector.
+//   C has two int32 lanes per 64-bit word by default; unused lanes are zero.
 // SRAM instances and initialization remain outside this module.
 //-----------------------------------------------------------------------------
 module gemm_accelerator_top_mac_array #(
@@ -26,7 +28,8 @@ module gemm_accelerator_top_mac_array #(
   parameter int unsigned NumCores       = 16,
   parameter int unsigned NumInputs      = 32,
   parameter int unsigned SramADataWidth = 512,
-  parameter int unsigned SramBDataWidth = 480,
+  parameter int unsigned SramBDataWidth = 448,
+  parameter int unsigned SramCDataWidth = 64,
   parameter int unsigned MReuse         = 4
 ) (
   input  logic                            clk_i,
@@ -42,12 +45,13 @@ module gemm_accelerator_top_mac_array #(
   output logic                            sram_b_re_o,
   input  logic [SramADataWidth-1:0]        sram_a_rdata_i,
   input  logic [SramBDataWidth-1:0]        sram_b_rdata_i,
-  output logic signed [OutDataWidth-1:0]  sram_c_wdata_o,
+  output logic [SramCDataWidth-1:0]       sram_c_wdata_o,
   output logic                            sram_c_we_o,
   output logic                            done_o
 );
   localparam int unsigned AElements = SramADataWidth / InDataWidth;
   localparam int unsigned BElements = SramBDataWidth / InDataWidth;
+  localparam int unsigned CElements = SramCDataWidth / OutDataWidth;
   localparam int unsigned TileElements = NumCores * NumInputs;
   localparam int unsigned TileBits = TileElements * InDataWidth;
   localparam int unsigned AReadWords = (TileElements + AElements - 1) / AElements;
@@ -121,7 +125,7 @@ module gemm_accelerator_top_mac_array #(
   logic [CoreCountWidth-1:0] c_count_q;
   logic [NumCores*OutDataWidth-1:0] c_buffer_q;
 
-  logic [CalcWidth-1:0] k_blocks, a_words_per_row, m_group_base;
+  logic [CalcWidth-1:0] k_blocks, a_words_per_row, c_words_per_row, m_group_base;
   logic [CalcWidth-1:0] a_word_address, b_word_address, c_base_address;
   logic [CalcWidth-1:0] remaining_cores, remaining_inputs, remaining_rows;
   logic [CoreCountWidth-1:0] active_cores;
@@ -162,12 +166,15 @@ module gemm_accelerator_top_mac_array #(
   );
 
   //---------------------------
-  // SRAM word addresses: physical packing is unchanged from the reference.
+  // SRAM word addresses. C rows are padded so partial writes cannot overwrite
+  // a result from the next row; the SRAM always writes a complete word.
   //---------------------------
   always_comb begin
     k_blocks = (CalcWidth'(K_size_q) + CalcWidth'(NumInputs-1)) / CalcWidth'(NumInputs);
     a_words_per_row = (CalcWidth'(K_size_q) + CalcWidth'(AElements-1)) /
                       CalcWidth'(AElements);
+    c_words_per_row = (CalcWidth'(N_size_q) + CalcWidth'(CElements-1)) /
+                      CalcWidth'(CElements);
     row_in_group = is_gemv ? '0 : ReuseWidth'(CalcWidth'(M_count) % CalcWidth'(MReuse));
     m_group_base = is_gemv ? CalcWidth'(M_count) :
                    CalcWidth'(M_count) - CalcWidth'(row_in_group);
@@ -182,7 +189,7 @@ module gemm_accelerator_top_mac_array #(
                          CalcWidth'(K_count) / CalcWidth'(NumInputs)) *
                          CalcWidth'(AReadWords) + CalcWidth'(read_beat_q);
       b_word_address = CalcWidth'(K_count) / CalcWidth'(NumInputs);
-      c_base_address = CalcWidth'(M_count);
+      c_base_address = CalcWidth'(M_count) / CalcWidth'(CElements);
       remaining_cores = CalcWidth'(M_size_q) - CalcWidth'(M_count);
     end else begin
       // During the B burst, fetch/cache one A word for each active M row.
@@ -191,7 +198,8 @@ module gemm_accelerator_top_mac_array #(
       b_word_address = ((CalcWidth'(N_count) / CalcWidth'(NumCores)) * k_blocks +
                          CalcWidth'(K_count) / CalcWidth'(NumInputs)) *
                          CalcWidth'(BReadWords) + CalcWidth'(read_beat_q);
-      c_base_address = CalcWidth'(M_count) * CalcWidth'(N_size_q) + CalcWidth'(N_count);
+      c_base_address = CalcWidth'(M_count) * c_words_per_row +
+                       CalcWidth'(N_count) / CalcWidth'(CElements);
       remaining_cores = CalcWidth'(N_size_q) - CalcWidth'(N_count);
     end
     remaining_inputs = CalcWidth'(K_size_q) - CalcWidth'(K_count);
@@ -345,7 +353,7 @@ module gemm_accelerator_top_mac_array #(
           c_ready_q[c_head_q] <= 1'b0;
           c_head_q <= next_slot(c_head_q);
           c_core_q <= '0;
-        end else c_core_q <= c_core_q + CoreWidth'(1);
+        end else c_core_q <= c_core_q + CoreWidth'(CElements);
       end
       // c_o identifies the last completed context, independent of a later ISSUE.
       // Capture before this edge's next MAC result updates via NBA.
@@ -360,10 +368,19 @@ module gemm_accelerator_top_mac_array #(
   assign c_count_q = c_counts_q[c_head_q];
   assign c_buffer_q = c_data_q[c_head_q];
   assign sram_c_we_o = c_valid_q;
-  assign sram_c_addr_o = c_base_q + AddrWidth'(c_core_q);
-  assign sram_c_wdata_o = $signed(c_buffer_q[int'(c_core_q)*OutDataWidth +: OutDataWidth]);
+  assign sram_c_addr_o = c_base_q + AddrWidth'(int'(c_core_q) / CElements);
+  // Each lane remains an int32 result. Only the physical SRAM word is wider.
+  // Zero-padding the final word also keeps every written bit defined.
+  always_comb begin
+    sram_c_wdata_o = '0;
+    for (int unsigned lane=0; lane<CElements; lane++) begin
+      if ((int'(c_core_q) + lane) < int'(c_count_q))
+        sram_c_wdata_o[lane*OutDataWidth +: OutDataWidth] =
+          c_buffer_q[(int'(c_core_q)+lane)*OutDataWidth +: OutDataWidth];
+    end
+  end
   assign last_c_write = c_valid_q &&
-    (CoreCountWidth'(c_core_q) + CoreCountWidth'(1) == c_count_q);
+    (CoreCountWidth'(c_core_q) + CoreCountWidth'(CElements) >= c_count_q);
 
   //---------------------------
   // One shared 512-MAC array; context zero is used for GeMV.
@@ -404,7 +421,10 @@ module gemm_accelerator_top_mac_array #(
     if ((SramADataWidth % InDataWidth) != 0 || (SramBDataWidth % InDataWidth) != 0 ||
         AElements < NumInputs || BElements < NumInputs || (AElements % NumInputs) != 0)
       $fatal(1, "SRAM words require whole elements; A requires whole K blocks.");
-    if (SramADataWidth + SramBDataWidth + OutDataWidth > 1024)
+    if ((SramCDataWidth % OutDataWidth) != 0 || CElements == 0 ||
+        CElements > NumCores || (NumCores % CElements) != 0)
+      $fatal(1, "SRAM C requires whole int32 lanes and whole words per core tile.");
+    if (SramADataWidth + SramBDataWidth + SramCDataWidth > 1024)
       $fatal(1, "Total physical SRAM port width exceeds 1024 bits.");
   end
   always @(posedge clk_i) begin
@@ -415,7 +435,9 @@ module gemm_accelerator_top_mac_array #(
           (sram_b_re_o && ((b_word_address >> AddrWidth) != '0)))
         $fatal(1, "Active SRAM word address does not fit AddrWidth.");
       if (reserve_output &&
-          ((c_base_address + CalcWidth'(active_cores)-CalcWidth'(1)) >> AddrWidth) != '0)
+          ((c_base_address +
+            (CalcWidth'(active_cores)+CalcWidth'(CElements-1))/CalcWidth'(CElements) -
+            CalcWidth'(1)) >> AddrWidth) != '0)
         $fatal(1, "C word address does not fit AddrWidth.");
       if (output_queue_used_q > QueueCountWidth'(QueueDepth))
         $fatal(1, "Output FIFO overflow.");

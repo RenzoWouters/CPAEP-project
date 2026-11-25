@@ -1055,6 +1055,9 @@ module tb_mac_array_gemm;
     tb_bank_wdata = '1;
     tb_bank_re = '1;
     tb_bank_we = '1;
+    $display("\n[SRAM NEGATIVE TEST] Expecting %0d intentional errors (one per bank).", NumBanks);
+    $display("Read and write are deliberately enabled together for one cycle.");
+    $display("This tests SRAM error detection and covers its error branch.");
     $display("[SRAM NEGATIVE BEGIN] expected_errors=%0d address=0", NumBanks);
     @(posedge clk_i); #1;
     if (sram_negative_cycles != 1)
@@ -1138,7 +1141,8 @@ module tb_mac_array_gemm;
       $display(" Mean temporal utilization : %0.2f%%",temporal_sum/NumWorkloads);
       $display(" Mean total utilization    : %0.2f%%",total_sum/NumWorkloads);
     end else $display(" Mean normalized latency INVALID: required workload failure.");
-    $display("\n Area                      : %0.2f area units",metrics_pkg::area);
+    $display("-------------------------------------------------------------------------------------------------------------");
+    $display(" Area                      : %0.2f area units",metrics_pkg::area);
     $display("=============================================================================================================\n");
     if(num_failed!=0) $fatal(1,"%0d of%0d cases FAILED.",num_failed,NumCases);
   endtask
@@ -1168,6 +1172,9 @@ module tb_mac_array_gemm;
       real ops,peak,compute_slots,total_slots;
       active_case_name=test_cases[c].name;
       M_i=SizeAddrWidth'(test_cases[c].M);K_i=SizeAddrWidth'(test_cases[c].K);N_i=SizeAddrWidth'(test_cases[c].N);
+      if(c<NumWorkloads)
+        $display("\n[%0s] A (%0d x %0d) * B (%0d x %0d) -> C (%0d x %0d)",
+                 active_case_name,M_i,K_i,K_i,N_i,M_i,N_i);
       initialize_memories(c,test_cases[c].M,test_cases[c].K,test_cases[c].N);
       coverage.sample();
       gemm_golden(test_cases[c].M,test_cases[c].K,test_cases[c].N);clk_delay(1);
@@ -1182,6 +1189,9 @@ module tb_mac_array_gemm;
       case_spatial_util[c]=(compute_slots>0)?100.0*ops/compute_slots:0;
       case_temporal_util[c]=(case_cycles[c]>0)?100.0*real'(mac_compute_cycles)/real'(case_cycles[c]):0;
       case_total_util[c]=(total_slots>0)?100.0*ops/total_slots:0;
+      if(c<NumWorkloads)
+        $display("[%0s] %0s: %0d cycles, %0.2f energy units",
+                 active_case_name,(case_errors[c]==0)?"PASS":"FAIL",case_cycles[c],case_energy[c]);
       if(case_errors[c]!=0) $fatal(1,"[%0s] Matrix/check failure.",active_case_name);
       repeat(2) begin clk_delay(1);if(done!==1'b0) $fatal(1,"done must pulse for one cycle.");end
       monitor_active=0;case_finished=0;clk_delay(8);

@@ -1,12 +1,13 @@
+
 //-----------------------------------------------------------------------------
 // Hierarchical MAC Array: NumCores parallel dot-product cores of NumInputs MACs
-// Default: 16 cores x 32 MACs = 512 MACs
+// Default: 16 cores x 8 MACs = 128 MACs
 //-----------------------------------------------------------------------------
 
 module mac_array #(
   parameter int unsigned InDataWidth  = 8,
   parameter int unsigned NumCores     = 16,
-  parameter int unsigned NumInputs    = 32,
+  parameter int unsigned NumInputs    = 8,
   parameter int unsigned OutDataWidth = 32
 ) (
   input  logic                                                      clk_i,

@@ -1,27 +1,35 @@
+
 //---------------------------
-// The GeMM / GeMV Controller Module for MAC Array (16 cores x 32 inputs = 512 MACs)
+// The GeMM / GeMV Controller Module for MAC Array
 // File: gemm_controller_mac_array.sv
 //
 // Description:
-// Controller for a 16x32 MAC array:
-// - Each K step advances by NumInputs (32) elements along K.
-// - When N_size_i == 1 (GeMV), NumCores (16) cores process 16 rows of M
-//   in parallel (M ceiling = ceil(M_size_i / 16), M_count_o stepped by 16).
-// - When N_size_i > 1 (GeMM), NumCores (16) cores process 16 columns of N
-//   in parallel (N ceiling = ceil(N_size_i / 16), N_count_o stepped by 16).
+// Parameterized controller for a MAC array:
+//
+// - Each K step advances by NumInputs elements along K.
+// - When N_size_i == 1 (GeMV), NumCores cores process
+//   NumCores rows of M in parallel.
+//   M_count_o advances by NumCores.
+// - When N_size_i > 1 (GeMM), NumCores cores process
+//   NumCores columns of N in parallel.
+//   N_count_o advances by NumCores.
+//
+// For the 16x8 configuration:
+// - 16 cores x 8 inputs = 128 MACs.
+// - Each K step advances by 8 elements.
 //
 // Pipeline timing (assuming 1-cycle synchronous SRAM read + 1-cycle MAC):
 //   cycle t   : counters issue step indices for (m, n, k) as A/B addresses
 //   cycle t+1 : A/B data reaches the MAC array
 //               data_valid_o = 1, init_save_o = 1 if first K step
 //   cycle t+2 : if last K step, MAC outputs hold finished results
-//               result_valid_o = 1 (write 16 outputs to SRAM C)
+//               result_valid_o = 1 (write NumCores outputs to SRAM C)
 //---------------------------
 
 module gemm_controller_mac_array #(
   parameter int unsigned AddrWidth = 16,
   parameter int unsigned NumCores  = 16,
-  parameter int unsigned NumInputs = 32
+  parameter int unsigned NumInputs = 8
 )(
   input  logic                   clk_i,
   input  logic                   rst_ni,
@@ -73,10 +81,10 @@ module gemm_controller_mac_array #(
   assign is_gemv_o = is_gemv;
 
   // Pipeline registers that follow the read latency of the SRAMs
-  logic data_valid_q;    // A/B data at the MAC inputs is valid
-  logic first_k_q;       // ... and it is the first K block of an output
-  logic last_k_q;        // ... and it is the last K block of an output
-  logic result_valid_q;  // MAC outputs hold finished C elements
+  logic data_valid_q;
+  logic first_k_q;
+  logic last_k_q;
+  logic result_valid_q;
 
   // State machine states
   typedef enum logic [1:0] {
@@ -93,42 +101,57 @@ module gemm_controller_mac_array #(
                   (current_state == ControllerFinish);
 
   //-----------------------
-  // Ceilings for 16 cores x 32 inputs
+  // Calculate dimension ceilings
   //-----------------------
   always_comb begin
-    // K advances by NumInputs (32) per step
+    // K advances by NumInputs elements per step
     k_ceiling = (K_size_i + AddrWidth'(NumInputs - 1)) / AddrWidth'(NumInputs);
+
     if (k_ceiling == '0) begin
       k_ceiling = {{(AddrWidth-1){1'b0}}, 1'b1};
     end
 
     if (is_gemv) begin
-      // GeMV: 16 cores compute 16 rows of M in parallel; N is 1
+      // GeMV: NumCores cores compute NumCores rows of M in parallel
       m_ceiling = (M_size_i + AddrWidth'(NumCores - 1)) / AddrWidth'(NumCores);
+
       if (m_ceiling == '0) begin
         m_ceiling = {{(AddrWidth-1){1'b0}}, 1'b1};
       end
+
       n_ceiling = {{(AddrWidth-1){1'b0}}, 1'b1};
+
     end else begin
-      // GeMM: 16 cores compute 16 columns of N in parallel; M steps by 1
+      // GeMM: NumCores cores compute NumCores columns of N in parallel
+      // M is processed one row at a time
       m_ceiling = (M_size_i == '0) ? {{(AddrWidth-1){1'b0}}, 1'b1} : M_size_i;
+
       n_ceiling = (N_size_i + AddrWidth'(NumCores - 1)) / AddrWidth'(NumCores);
+
       if (n_ceiling == '0) begin
         n_ceiling = {{(AddrWidth-1){1'b0}}, 1'b1};
       end
     end
   end
 
+  //-----------------------
   // Convert step indices to element offsets
+  //-----------------------
   assign K_count_o = k_step_count * AddrWidth'(NumInputs);
-  assign M_count_o = is_gemv ? (m_step_count * AddrWidth'(NumCores)) : m_step_count;
-  assign N_count_o = is_gemv ? n_step_count : (n_step_count * AddrWidth'(NumCores));
+
+  assign M_count_o = is_gemv
+                   ? (m_step_count * AddrWidth'(NumCores))
+                   : m_step_count;
+
+  assign N_count_o = is_gemv
+                   ? n_step_count
+                   : (n_step_count * AddrWidth'(NumCores));
 
   //-----------------------
   // Counters for M, K, N steps
   //-----------------------
 
-  // K Step Counter (each step = 32 elements along K)
+  // K Step Counter: each step = NumInputs elements along K
   ceiling_counter #(
     .Width        ( AddrWidth  ),
     .HasCeiling   ( 1          )
@@ -142,7 +165,9 @@ module gemm_controller_mac_array #(
     .last_value_o ( move_N_counter )
   );
 
-  // N Step Counter (each step = 16 columns in GeMM, 1 in GeMV)
+  // N Step Counter:
+  // GeMM: each step = NumCores columns
+  // GeMV: only one N step is required
   ceiling_counter #(
     .Width        ( AddrWidth  ),
     .HasCeiling   ( 1          )
@@ -156,7 +181,9 @@ module gemm_controller_mac_array #(
     .last_value_o ( move_M_counter )
   );
 
-  // M Step Counter (each step = 16 rows in GeMV, 1 row in GeMM)
+  // M Step Counter:
+  // GeMM: each step = 1 row
+  // GeMV: each step = NumCores rows
   ceiling_counter #(
     .Width        ( AddrWidth               ),
     .HasCeiling   ( 1                       )
@@ -182,8 +209,10 @@ module gemm_controller_mac_array #(
     end else begin
       data_valid_q   <= move_counter;
       first_k_q      <= move_counter && (k_step_count == '0);
+
       // move_N_counter is asserted when k_step_count is at its last step
       last_k_q       <= move_counter && move_N_counter;
+
       result_valid_q <= last_k_q;
     end
   end
@@ -211,18 +240,27 @@ module gemm_controller_mac_array #(
     done_o         = 1'b0;
 
     case (current_state)
-        ControllerIdle: begin
+
+      ControllerIdle: begin
         if (start_i) begin
-            move_counter = input_valid_i;
-            next_state   = last_counter_last_value
-                        ? ControllerDrain
-                        : ControllerBusy;
+          move_counter = input_valid_i;
+
+          // Only finish issuing transactions when the final transaction
+          // is actually accepted.
+          if (input_valid_i && last_counter_last_value) begin
+            next_state = ControllerDrain;
+          end else begin
+            next_state = ControllerBusy;
+          end
         end
-        end
+      end
 
       ControllerBusy: begin
         move_counter = input_valid_i;
-        if (last_counter_last_value) begin
+
+        // Do not enter the drain state until the final transaction
+        // has actually been accepted.
+        if (input_valid_i && last_counter_last_value) begin
           next_state = ControllerDrain;
         end
       end
@@ -240,6 +278,7 @@ module gemm_controller_mac_array #(
       default: begin
         next_state = ControllerIdle;
       end
+
     endcase
   end
 

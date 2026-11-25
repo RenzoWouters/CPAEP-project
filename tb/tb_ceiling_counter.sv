@@ -42,6 +42,9 @@ module tb_ceiling_counter;
   // Some other control signals
   logic [Width-1:0] ceiling_value;
 
+  // Track mismatches so the final PASS message reflects the checks.
+  int unsigned error_count;
+
   //---------------------------
   // DUT instantiation
   //---------------------------
@@ -75,6 +78,8 @@ module tb_ceiling_counter;
 
   // Sequence driver
   initial begin
+    error_count = 0;
+
     // Initial reset
     rst_ni    = 1'b0;
     tick_i    = 1'b0;
@@ -95,7 +100,7 @@ module tb_ceiling_counter;
       ceiling_value = $urandom();
       ceiling_i     = ceiling_value;
       // Debug log
-      $display("Test %0d: Ceiling value set to %0d", test_num, ceiling_value);
+      $display("Test %0d: Ceiling value set to %0d", test_num + 1, ceiling_value);
 
       // Iterate through ceiling value and per tick
       // check the output of the counter
@@ -105,6 +110,7 @@ module tb_ceiling_counter;
         // It should start at 0 from a fresh restart or clear
         // Then every iteration it updates accordingly
         if (count_o !== tick_num) begin
+          error_count++;
           $error("Count mismatch at tick %0d: expected %0d, got %0d",
                  tick_num, tick_num, count_o);
         end
@@ -122,6 +128,11 @@ module tb_ceiling_counter;
     end
 
     $display("Ceiling Counter Testbench completed.");
+    if (error_count == 0) begin
+      $display("All %0d tests passed!", NumTests);
+    end else begin
+      $fatal(1, "Ceiling Counter Testbench FAILED: %0d count mismatches.", error_count);
+    end
     $finish;
   end
 

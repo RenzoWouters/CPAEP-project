@@ -6,13 +6,16 @@
 
 // Expanded boundary, data-pattern and functional-coverage regression.
 // Additional random-data runs cover all six required workload dimensions.
-// MReuse row-bank boundaries, exact B-traffic checks and C-backpressure metrics
-// compare the new GeMM reuse schedule against the preserved original run.
-// C packs two int32 results per 64-bit word by default; GeMM rows are padded
-// independently, while GeMV packs consecutive M results into complete words.
-// Fixed A/B/C words are 688/256/64 bits for both GeMM and GeMV.
-// GeMM A uses 64 useful bytes plus 22 padding bytes per word; GeMV uses all 86.
-// The A-bandwidth change is compared with the saved A512/B448 prefetch run.
+// GeMM maps 2 M rows x 8 N columns x 32 K lanes onto the existing 16 cores.
+// MReuse counts M rows per B tile; 64 rows use 32 accumulator contexts.
+// A row-pair stream and two B banks overlap SRAM loading with computation.
+// Fixed A/B/C words are 832/64/128 bits for both GeMM and GeMV.
+// GeMM A has 64 useful bytes plus 40 padding bytes per physical word.
+// GeMV A uses five words per tile; each B vector fragment uses four words.
+// C packs four int32 results per word; each GeMM row is padded separately.
+// Compare all six workload metrics against accepted A688/B256/C64, MReuse16.
+// Exact operand traffic/order, nonzero padding, bank switching and backpressure
+// are checked without changing the independent logical-matrix golden model.
 // Phase 1: one initial reset, then all matrix cases without a DUT reset.
 // Phase 2: directed reset/abort/restart tests on the same DUT and SRAMs.
 // Both phases contribute to the same simulation's code coverage.
@@ -39,18 +42,21 @@ module tb_mac_array_gemm;
 
  parameter int unsigned NumInputs      = 32;
 
- parameter int unsigned MReuse         = 16;
+ parameter int unsigned GemmRows       = 2;
 
- parameter int unsigned SramADataWidth = 688;
+ parameter int unsigned MReuse         = 64;
 
- parameter int unsigned SramBDataWidth = 256;
+ parameter int unsigned SramADataWidth = 832;
 
- parameter int unsigned SramCDataWidth = 64;
+ parameter int unsigned SramBDataWidth = 64;
+
+ parameter int unsigned SramCDataWidth = 128;
 
  parameter int unsigned DataDepthA     = 131072;
 
- // GeMM 3 occupies 36 B tiles x 16 words = 576 words at B=256 bits.
- parameter int unsigned DataDepthB     = 1024;
+ // GeMM 3 occupies 4 N tiles x18 K blocks x32 B64 words =2304 words.
+ // 4096 x64 bits preserves the previous 1024 x256-bit B capacity.
+ parameter int unsigned DataDepthB     = 4096;
 
  parameter int unsigned DataDepthC     = 4096;
 
@@ -62,8 +68,9 @@ module tb_mac_array_gemm;
 
  localparam int unsigned AElements = SramADataWidth / InDataWidth;
 
- // GeMM uses whole K blocks per A word; GeMV uses all physical A lanes.
- localparam int unsigned AGemmElements = (AElements / NumInputs) * NumInputs;
+ // One A word holds GemmRows row fragments of NumInputs elements.
+ localparam int unsigned GemmCols = NumCores / GemmRows;
+ localparam int unsigned NumContexts = MReuse / GemmRows;
 
  localparam int unsigned BElements = SramBDataWidth / InDataWidth;
 
@@ -73,7 +80,10 @@ module tb_mac_array_gemm;
 
  localparam int unsigned AReadWords = (TileElements + AElements - 1) / AElements;
 
- localparam int unsigned BReadWords = (TileElements + BElements - 1) / BElements;
+ localparam int unsigned GemmTileElements = GemmCols * NumInputs;
+ localparam int unsigned BReadWords = (GemmTileElements + BElements - 1) / BElements;
+ localparam int unsigned VectorReadWords = (NumInputs + BElements - 1) / BElements;
+ localparam int unsigned GemvLoadWords = (AReadWords > VectorReadWords) ? AReadWords : VectorReadWords;
 
  //---------------------------
 
@@ -99,7 +109,7 @@ module tb_mac_array_gemm;
 
  localparam int unsigned NumWorkloads = 6;
 
- localparam int unsigned NumCases     = 42;
+ localparam int unsigned NumCases     = 53;
 
  // Measured in Performance evolution/iteration1.txt, before M-row reuse.
  // This is a comparison reference, not a performance assertion or new run.
@@ -115,16 +125,15 @@ module tb_mac_array_gemm;
  localparam int unsigned PreviousC32Cycles [NumWorkloads] =
    '{2077, 2105, 8129, 17300, 61460, 112660};
  localparam bit HasComparableC32Reference = HasComparableBaseline && (MReuse == 4);
- // User-confirmed A512/B448/C64, MReuse8 run with GeMV prefetch.
- // These are measured comparison values, not expected results for this run.
- localparam int unsigned PreviousPrefetchCycles [NumWorkloads] =
-   '{1059, 1277, 5533, 13837, 49165, 90125};
- // A/B widths intentionally differ from the reference; all other scored
- // arithmetic dimensions and the selected MReuse/C configuration agree.
- localparam bit HasComparablePrefetchReference =
+ // Accepted A688/B256/C64, MReuse16 reference from the previous architecture.
+ // These are measured comparison values, not expected results or assertions.
+ localparam int unsigned PreviousMReuse16Cycles [NumWorkloads] =
+   '{1079, 1173, 4869, 10381, 36877, 67597};
+ // Port widths, mapping and reuse intentionally differ; the same six logical
+ // workloads and 512 int8/int32 MAC lanes make their latency directly comparable.
+ localparam bit HasComparableMReuse16Reference =
    (NumCores == 16) && (NumInputs == 32) &&
-   (InDataWidth == 8) && (OutDataWidth == 32) && (MReuse == 8) &&
-   (SramADataWidth == 688) && (SramBDataWidth == 256) && (SramCDataWidth == 64);
+   (InDataWidth == 8) && (OutDataWidth == 32);
 
  typedef enum int unsigned {
    ResetTopStart,
@@ -133,12 +142,15 @@ module tb_mac_array_gemm;
    ResetTopIssue,
    ResetControllerDrain,
    ResetDuringCWrite,
-   ResetPrefetchPending
+   ResetPrefetchPending,
+   ResetBPrefetchPending,
+   ResetBankSwitch,
+   ResetOutputBackpressure
  } reset_target_t;
 
  localparam int unsigned NumResetTargets = 6;
- localparam int unsigned NumResetCases   = 2 * NumResetTargets + 1;
- // Six existing targets in both modes, plus one GeMV prefetch-in-flight reset.
+ localparam int unsigned NumResetCases   = 2 * NumResetTargets + 4;
+ // Six targets in each mode, GeMV prefetch, and three GeMM overlap/FIFO targets.
 
  // Pattern IDs: 0=random, 1=zero, 2=+1, 3=-1, 4=A:-1/B:+1,
  //              5=+127, 6=-128, 7=alternating A / B:+1.
@@ -209,7 +221,26 @@ module tb_mac_array_gemm;
 
    // Every K block finishes an output group; the final M group is partial.
    // This exercises successive initialized results with the merged GeMV ISSUE.
-   '{"GeMV consecutive", 2*NumCores+1, NumInputs, 1, 0}
+   '{"GeMV consecutive", 2*NumCores+1, NumInputs, 1, 0},
+
+   // Pair and N-tile boundaries, including one inactive M row in a pair.
+   '{"GeMM pair below", GemmRows-1, NumInputs-1, GemmCols-1, 0},
+   '{"GeMM pair exact", GemmRows, NumInputs, GemmCols, 0},
+   '{"GeMM pair above", GemmRows+1, NumInputs+1, GemmCols+1, 0},
+
+   // C word boundaries in both rows of one result group.
+   '{"GeMM C below", GemmRows+1, NumInputs-1, CElements-1, 0},
+   '{"GeMM C exact", GemmRows+1, NumInputs, CElements, 0},
+   '{"GeMM C above", GemmRows+1, NumInputs+1, CElements+1, 0},
+
+   // Multiple B64 responses assemble one shared GeMV vector fragment.
+   '{"GeMV B below", NumCores+1, BElements-1, 1, 0},
+   '{"GeMV B exact", NumCores+1, BElements, 1, 0},
+   '{"GeMV B above", NumCores+1, BElements+1, 1, 0},
+
+   // Nonzero input padding makes missing operand masks visible numerically.
+   '{"GeMM poison tails", GemmRows+1, NumInputs+1, GemmCols+1, 0},
+   '{"GeMV poison tails", NumCores+1, NumInputs+1, 1, 0}
  };
 
  int unsigned     case_cycles [NumCases];
@@ -233,6 +264,8 @@ module tb_mac_array_gemm;
 
  longint unsigned case_output_stalls [NumCases];
  int unsigned case_queue_peak [NumCases];
+ longint unsigned case_b_overlap_cycles [NumCases];
+ longint unsigned case_b_bank_switches [NumCases];
 
  //---------------------------
 
@@ -273,6 +306,8 @@ module tb_mac_array_gemm;
  longint unsigned mac_compute_cycles;
  longint unsigned output_stall_cycles;
  int unsigned output_queue_peak;
+ longint unsigned b_overlap_cycles, b_bank_switches;
+ bit previous_b_bank, seen_gemm_issue;
 
  bit monitor_active, case_finished;
 
@@ -406,7 +441,7 @@ module tb_mac_array_gemm;
 
    .AddrWidth(AddrWidth), .SizeAddrWidth(SizeAddrWidth),
 
-   .NumCores(NumCores), .NumInputs(NumInputs), .MReuse(MReuse),
+   .NumCores(NumCores), .NumInputs(NumInputs), .GemmRows(GemmRows), .MReuse(MReuse),
 
    .SramADataWidth(SramADataWidth), .SramBDataWidth(SramBDataWidth),
 
@@ -472,7 +507,8 @@ module tb_mac_array_gemm;
 
  );
 
-   int unsigned k_blocks, a_words_per_row;
+   int unsigned k_blocks;
+   bit poison_padding;
 
    int unsigned word_addr, lane, element;
 
@@ -488,19 +524,21 @@ module tb_mac_array_gemm;
 
    k_blocks = (k_sz + NumInputs - 1) / NumInputs;
 
-   a_words_per_row = (k_sz + AGemmElements - 1) / AGemmElements;
+   poison_padding = !force_random &&
+     ((test_cases[test_id].name == "GeMM poison tails") ||
+      (test_cases[test_id].name == "GeMV poison tails"));
 
    if (n_sz == 1) begin
 
      a_used_words = ((m_sz + NumCores - 1) / NumCores) * k_blocks * AReadWords;
 
-     b_used_words = k_blocks;
+     b_used_words = k_blocks * VectorReadWords;
 
    end else begin
 
-     a_used_words = m_sz * a_words_per_row;
+     a_used_words = ((m_sz + GemmRows - 1) / GemmRows) * k_blocks;
 
-     b_used_words = ((n_sz + NumCores - 1) / NumCores) * k_blocks * BReadWords;
+     b_used_words = ((n_sz + GemmCols - 1) / GemmCols) * k_blocks * BReadWords;
 
    end
 
@@ -540,6 +578,10 @@ module tb_mac_array_gemm;
    mac_compute_cycles = 0;
    output_stall_cycles = 0;
    output_queue_peak = 0;
+   b_overlap_cycles = 0;
+   b_bank_switches = 0;
+   previous_b_bank = 0;
+   seen_gemm_issue = 0;
 
 
    // The case table selects the pattern explicitly, independent of its index.
@@ -573,7 +615,7 @@ module tb_mac_array_gemm;
      endcase
    end
 
-   // Keep the cache-reuse test sensitive to stale cached A data.
+   // Repeated addresses contain new operands, exposing stale buffered data.
    if (test_id == 8 || test_id == 9) begin
      A_ref[0] = (test_id % 2 == 0) ? 8'sh80 : 8'sd127;
      B_ref[0] = (test_id % 2 == 0) ? 8'sd127 : 8'sh80;
@@ -587,11 +629,13 @@ module tb_mac_array_gemm;
        B_ref[k_sz*n_sz - 1] = (test_id % 2 == 0) ? 8'sh80 : 8'sd127;
    end
 
-   // Padding is zero. C is poisoned so unwritten results cannot pass silently.
-
-   for (int unsigned w = 0; w < a_used_words; w++) i_sram_a.memory[w] = '0;
-
-   for (int unsigned w = 0; w < b_used_words; w++) i_sram_b.memory[w] = '0;
+   // Normal input padding is zero. Two directed cases instead use nonzero
+   // padding to check masks independently of the normal SRAM initialization.
+   // C is poisoned so unwritten results cannot pass silently.
+   for (int unsigned w = 0; w < a_used_words; w++)
+     i_sram_a.memory[w] = poison_padding ? {AElements{8'h5a}} : '0;
+   for (int unsigned w = 0; w < b_used_words; w++)
+     i_sram_b.memory[w] = poison_padding ? {BElements{8'ha5}} : '0;
 
    for (int unsigned w = 0; w < DataDepthC; w++) i_sram_c.memory[w] = 'x;
 
@@ -613,9 +657,9 @@ module tb_mac_array_gemm;
 
        end else begin
 
-         word_addr = m * a_words_per_row + k / AGemmElements;
+         word_addr = (m / GemmRows) * k_blocks + k / NumInputs;
 
-         lane = k % AGemmElements;
+         lane = (m % GemmRows) * NumInputs + k % NumInputs;
 
        end
 
@@ -633,15 +677,15 @@ module tb_mac_array_gemm;
 
        if (n_sz == 1) begin
 
-         word_addr = k / NumInputs;
+         word_addr = (k / NumInputs) * VectorReadWords + (k % NumInputs) / BElements;
 
-         lane = k % NumInputs;
+         lane = (k % NumInputs) % BElements;
 
        end else begin
 
-         element = (n % NumCores) * NumInputs + (k % NumInputs);
+         element = (n % GemmCols) * NumInputs + (k % NumInputs);
 
-         word_addr = ((n / NumCores) * k_blocks + k / NumInputs) * BReadWords +
+         word_addr = ((n / GemmCols) * k_blocks + k / NumInputs) * BReadWords +
 
                      element / BElements;
 
@@ -715,11 +759,12 @@ module tb_mac_array_gemm;
 
      blocks = ((m_sz + NumCores - 1) / NumCores) * k_blocks;
 
-     read_words = AReadWords;
+     read_words = GemvLoadWords;
 
    end else begin
 
-     blocks = m_sz * ((n_sz + NumCores - 1) / NumCores) * k_blocks;
+     blocks = ((m_sz + GemmRows - 1) / GemmRows) *
+              ((n_sz + GemmCols - 1) / GemmCols) * k_blocks;
 
      read_words = BReadWords;
 
@@ -795,9 +840,32 @@ module tb_mac_array_gemm;
  );
    longint unsigned k_blocks, n_groups, m_groups;
    k_blocks = (longint'(k_sz) + NumInputs - 1) / NumInputs;
-   n_groups = (longint'(n_sz) + NumCores - 1) / NumCores;
-   m_groups = (longint'(m_sz) + NumCores - 1) / NumCores;
-   return (n_sz == 1) ? m_groups*k_blocks : longint'(m_sz)*n_groups*k_blocks;
+   n_groups = (longint'(n_sz) + GemmCols - 1) / GemmCols;
+   m_groups = (longint'(m_sz) + ((n_sz == 1) ? NumCores : GemmRows) - 1) /
+              ((n_sz == 1) ? NumCores : GemmRows);
+   return (n_sz == 1) ? m_groups*k_blocks : m_groups*n_groups*k_blocks;
+ endfunction
+
+ // Decode the logical issue ordering to check every prefetched A address.
+ // Earlier M groups are full; only the final group has fewer row pairs.
+ function automatic longint unsigned expected_gemm_a_address(
+   input longint unsigned read_index,
+   input int unsigned m_sz, k_sz, n_sz
+ );
+   longint unsigned k_blocks, n_groups, full_group_issues;
+   longint unsigned m_group, active_pairs, remaining_rows, within_group;
+   longint unsigned pair_index, k_block;
+   k_blocks = (longint'(k_sz) + NumInputs - 1) / NumInputs;
+   n_groups = (longint'(n_sz) + GemmCols - 1) / GemmCols;
+   full_group_issues = longint'(NumContexts) * n_groups * k_blocks;
+   m_group = read_index / full_group_issues;
+   within_group = read_index % full_group_issues;
+   remaining_rows = longint'(m_sz) - m_group * MReuse;
+   active_pairs = ((remaining_rows < MReuse ? remaining_rows : MReuse) +
+                   GemmRows - 1) / GemmRows;
+   pair_index = within_group % active_pairs;
+   k_block = (within_group / active_pairs) % k_blocks;
+   return (m_group * NumContexts + pair_index) * k_blocks + k_block;
  endfunction
 
  function automatic longint unsigned expected_b_reads(
@@ -806,10 +874,10 @@ module tb_mac_array_gemm;
  );
    longint unsigned k_blocks, n_groups, m_groups;
    k_blocks = (longint'(k_sz) + NumInputs - 1) / NumInputs;
-   n_groups = (longint'(n_sz) + NumCores - 1) / NumCores;
+   n_groups = (longint'(n_sz) + GemmCols - 1) / GemmCols;
    if (n_sz == 1) begin
      m_groups = (longint'(m_sz) + NumCores - 1) / NumCores;
-     return m_groups*k_blocks;
+     return m_groups*k_blocks*VectorReadWords;
    end
    m_groups = (longint'(m_sz) + reuse_rows - 1) / reuse_rows;
    return m_groups*n_groups*k_blocks*BReadWords;
@@ -874,10 +942,11 @@ module tb_mac_array_gemm;
      num_errors++;
    end
 
-   if ((N_i == 1) &&
-       (a_reads != expected_compute_steps(M_i, K_i, N_i) * AReadWords)) begin
-     $display("ERROR: GeMV SRAM A reads=%0d, expected=%0d.",
-              a_reads, expected_compute_steps(M_i, K_i, N_i) * AReadWords);
+   if (a_reads != expected_compute_steps(M_i, K_i, N_i) *
+                  ((N_i == 1) ? AReadWords : 1)) begin
+     $display("ERROR: SRAM A reads=%0d, expected=%0d.",
+              a_reads, expected_compute_steps(M_i, K_i, N_i) *
+                       ((N_i == 1) ? AReadWords : 1));
      num_errors++;
    end
 
@@ -898,12 +967,15 @@ module tb_mac_array_gemm;
  function automatic string reset_target_name(input reset_target_t target);
    case (target)
      ResetTopStart:        return "TopStart";
-     ResetDuringLoad:      return "mid-load after first K block";
+     ResetDuringLoad:      return "operand load after first compute";
      ResetTopFlush:        return "TopFlush";
      ResetTopIssue:        return "ISSUE of second K block";
      ResetControllerDrain: return "ControllerDrain";
      ResetDuringCWrite:    return "partial C write in TopDrain";
      ResetPrefetchPending: return "prefetched A/B response pending";
+     ResetBPrefetchPending:return "B prefetch overlapping computation";
+     ResetBankSwitch:      return "first issue after B bank switch";
+     ResetOutputBackpressure:return "C FIFO backpressure";
      default:             return "unknown reset target";
    endcase
  endfunction
@@ -913,9 +985,10 @@ module tb_mac_array_gemm;
      ResetTopStart:
        return (i_dut.state_q === i_dut.TopStart);
      ResetDuringLoad:
-       return (i_dut.state_q === i_dut.TopLoad) &&
-              (i_dut.K_count == NumInputs) &&
-              (i_dut.read_beat_q != '0) && (mac_compute_cycles > 0);
+       return (mac_compute_cycles > 0) &&
+         ((N_i == 1) ? ((i_dut.state_q === i_dut.TopLoad) &&
+                        (i_dut.K_count == NumInputs) && (i_dut.read_beat_q != '0)) :
+                       (sram_b_re === 1'b1));
      ResetTopFlush:
        return (i_dut.state_q === i_dut.TopFlush);
      ResetTopIssue:
@@ -937,6 +1010,15 @@ module tb_mac_array_gemm;
               (i_dut.b_response_valid_q === 1'b1) &&
               (i_dut.a_response_beat_q == '0) &&
               (i_dut.valid_data === 1'b1);
+     ResetBPrefetchPending:
+       return (i_dut.is_gemv === 1'b0) &&
+              (i_dut.b_response_valid_q === 1'b1) && (i_dut.valid_data === 1'b1) &&
+              (i_dut.b_fetch_bank_q != i_dut.b_compute_bank_q);
+     ResetBankSwitch:
+       return (i_dut.is_gemv === 1'b0) && (i_dut.issue_block === 1'b1) &&
+              seen_gemm_issue && (i_dut.b_compute_bank_q != previous_b_bank);
+     ResetOutputBackpressure:
+       return (i_dut.is_gemv === 1'b0) && (i_dut.output_stall === 1'b1);
      default: return 1'b0;
    endcase
  endfunction
@@ -956,11 +1038,12 @@ module tb_mac_array_gemm;
         i_dut.controller_busy, i_dut.controller_done,
         i_dut.controller_done_seen_q,
         i_dut.a_response_valid_q, i_dut.b_response_valid_q,
-        i_dut.a_cache_valid_q, i_dut.output_slot_busy_q,
+        i_dut.b_valid_q, i_dut.a_ready_q, i_dut.a_used_q,
+        i_dut.a_fetch_done_q, i_dut.b_fetch_done_q, i_dut.output_slot_busy_q,
         i_dut.c_valid_q, i_dut.output_stall,
         i_dut.output_queue_used_q, i_dut.fifo_pending_valid_q,
         i_dut.c_ready_q} !== '0)
-     $fatal(1, "[%0s] Stale valid/busy/cache state during %0s.",
+     $fatal(1, "[%0s] Stale valid/busy/buffer state during %0s.",
             active_case_name, phase_label);
 
    if ({i_dut.M_count, i_dut.K_count, i_dut.N_count} !== '0)
@@ -991,9 +1074,15 @@ module tb_mac_array_gemm;
 
    // Two K blocks and more than one output tile exercise live accumulators,
    // buffers, response tags and the serialized C output before cancellation.
-   abort_m = abort_is_gemv ? (2 * NumCores) : 2;
+   abort_m = abort_is_gemv ? (2 * NumCores) : GemmRows;
    abort_k = 2 * NumInputs;
    abort_n = abort_is_gemv ? 1 : (2 * NumCores);
+   if ((target == ResetBPrefetchPending) || (target == ResetBankSwitch) ||
+       (target == ResetOutputBackpressure)) begin
+     abort_m = MReuse;
+     abort_n = 4 * GemmCols;
+   end
+   if (target == ResetOutputBackpressure) abort_k = NumInputs;
 
    M_i = SizeAddrWidth'(abort_m);
    K_i = SizeAddrWidth'(abort_k);
@@ -1112,6 +1201,9 @@ module tb_mac_array_gemm;
      end
    end
    run_reset_case(ResetPrefetchPending, 1'b1);
+   run_reset_case(ResetBPrefetchPending, 1'b0);
+   run_reset_case(ResetBankSwitch, 1'b0);
+   run_reset_case(ResetOutputBackpressure, 1'b0);
  endtask
 
  //---------------------------
@@ -1156,12 +1248,19 @@ module tb_mac_array_gemm;
          if (i_dut.valid_data) mac_compute_cycles++;
          if ($isunknown({i_dut.output_stall, i_dut.output_queue_used_q}))
            $fatal(1, "[%0s] Unknown output queue/backpressure state.", active_case_name);
-         if (int'(i_dut.output_queue_used_q) > MReuse)
+         if (int'(i_dut.output_queue_used_q) > NumContexts)
            $fatal(1, "[%0s] Output queue reservations exceed capacity.", active_case_name);
          // Count actual blocked issues; a busy C port alone is not a stall.
          if (i_dut.output_stall) output_stall_cycles++;
          if (int'(i_dut.output_queue_used_q) > output_queue_peak)
            output_queue_peak = int'(i_dut.output_queue_used_q);
+         if ((N_i != 1) && sram_b_re && i_dut.valid_data) b_overlap_cycles++;
+         if ((N_i != 1) && i_dut.issue_block) begin
+           if (seen_gemm_issue && (i_dut.b_compute_bank_q != previous_b_bank))
+             b_bank_switches++;
+           previous_b_bank = i_dut.b_compute_bank_q;
+           seen_gemm_issue = 1'b1;
+         end
        end
 
        if (sram_a_re) begin
@@ -1177,6 +1276,11 @@ module tb_mac_array_gemm;
          if ((N_i == 1) && (longint'(sram_a_addr) != a_reads))
            $fatal(1, "[%0s] GeMV A read %0d: address=%0d, expected=%0d.",
                   active_case_name, a_reads, sram_a_addr, a_reads);
+         if ((N_i != 1) &&
+             (longint'(sram_a_addr) != expected_gemm_a_address(a_reads, M_i, K_i, N_i)))
+           $fatal(1, "[%0s] GeMM A read %0d: address=%0d, expected=%0d.",
+                  active_case_name, a_reads, sram_a_addr,
+                  expected_gemm_a_address(a_reads, M_i, K_i, N_i));
 
          a_reads++;
 
@@ -1190,13 +1294,12 @@ module tb_mac_array_gemm;
 
                      active_case_name, sram_b_addr, b_used_words);
 
-         // Each M group traverses all K slices of the shared B vector once.
-         if ((N_i == 1) &&
-             (longint'(sram_b_addr) !=
-              b_reads % ((longint'(K_i) + NumInputs - 1) / NumInputs)))
-           $fatal(1, "[%0s] GeMV B read %0d: address=%0d, expected=%0d.",
-                  active_case_name, b_reads, sram_b_addr,
-                  b_reads % ((longint'(K_i) + NumInputs - 1) / NumInputs));
+         // Every M group traverses the packed B image in the same order.
+         // Includes every physical word of a GeMV vector fragment and every
+         // GeMM B tile, independently of prefetch/bank control in the DUT.
+         if (longint'(sram_b_addr) != (b_reads % b_used_words))
+           $fatal(1, "[%0s] B read %0d: address=%0d, expected=%0d.",
+                  active_case_name, b_reads, sram_b_addr, b_reads % b_used_words);
 
          b_reads++;
 
@@ -1281,6 +1384,10 @@ module tb_mac_array_gemm;
    mac_compute_cycles = 0;
    output_stall_cycles = 0;
    output_queue_peak = 0;
+   b_overlap_cycles = 0;
+   b_bank_switches = 0;
+   previous_b_bank = 0;
+   seen_gemm_issue = 0;
 
 
    seed_state = RandomSeed;
@@ -1296,8 +1403,10 @@ module tb_mac_array_gemm;
    clk_delay(1);
 
    $display("Random seed: 0x%08h", RandomSeed);
-   $display("GeMM MReuse=%0d; fixed SRAM widths A/B/C=%0d/%0d/%0d bits.",
-            MReuse, SramADataWidth, SramBDataWidth, SramCDataWidth);
+   $display("GeMM mapping=%0d M x%0d N x%0d K; MReuse=%0d rows, %0d contexts.",
+            GemmRows, GemmCols, NumInputs, MReuse, NumContexts);
+   $display("Fixed SRAM widths A/B/C=%0d/%0d/%0d bits for every workload.",
+            SramADataWidth, SramBDataWidth, SramCDataWidth);
    $display("C packing: %0d int32 results/word; GeMM row padding and GeMV final padding are zero.",
             CElements);
    $display("PHASE 1: %0d matrix cases without an intermediate DUT reset.", NumCases);
@@ -1321,7 +1430,7 @@ module tb_mac_array_gemm;
      initialize_memories(c, test_cases[c].M, test_cases[c].K, test_cases[c].N);
      $display("  Data pattern: %0s (id=%0d)", pattern_name(active_pattern), active_pattern);
      if (c == 8 || c == 9)
-       $display("  Cache check: A[0] and B[0] replaced with signed extremes.");
+       $display("  Repeated-address check: A[0] and B[0] replaced with signed extremes.");
      coverage.sample();
 
      gemm_golden(test_cases[c].M, test_cases[c].K, test_cases[c].N);
@@ -1339,6 +1448,8 @@ module tb_mac_array_gemm;
      case_c_writes[c] = c_writes;
      case_output_stalls[c] = output_stall_cycles;
      case_queue_peak[c] = output_queue_peak;
+     case_b_overlap_cycles[c] = b_overlap_cycles;
+     case_b_bank_switches[c] = b_bank_switches;
 
      // Charge each complete physical word, including padding/unused lanes.
 
@@ -1406,11 +1517,14 @@ module tb_mac_array_gemm;
 
                 a_reads, b_reads, c_writes, case_sram_energy[c]);
 
-       $display("  B traffic: %0d words versus %0d without M-row reuse at the current B width (%0.2fx fewer reads).",
-                b_reads, expected_b_reads(M_i, K_i, N_i, 1),
-                (b_reads != 0) ? real'(expected_b_reads(M_i, K_i, N_i, 1)) / real'(b_reads) : 0.0);
+       $display("  B traffic: %0d words versus %0d without temporal M reuse at the current B width (%0.2fx fewer reads).",
+                b_reads, expected_b_reads(M_i, K_i, N_i, GemmRows),
+                (b_reads != 0) ? real'(expected_b_reads(M_i, K_i, N_i, GemmRows)) / real'(b_reads) : 0.0);
        $display("  C backpressure: %0d blocked issue cycles; peak output groups reserved=%0d/%0d.",
-                output_stall_cycles, output_queue_peak, MReuse);
+                output_stall_cycles, output_queue_peak, NumContexts);
+       if (N_i != 1)
+         $display("  B overlap: %0d read/compute cycles; %0d accepted bank switches.",
+                  b_overlap_cycles, b_bank_switches);
        if ((c < NumWorkloads) && HasComparableBaseline)
          $display("  Original latency=%0d cycles; measured speedup=%0.3fx.",
                   BaselineCycles[c], real'(BaselineCycles[c]) / real'(case_cycles[c]));
@@ -1496,18 +1610,18 @@ module tb_mac_array_gemm;
  // Compare all five requested metrics for each of the six required workloads.
  // The saved reference uses all 512 lanes on every accepted compute cycle,
  // so its spatial utilization is 100% and temporal equals total utilization.
- task automatic print_prefetch_comparison();
+ task automatic print_mreuse16_comparison();
    real operations, reference_normalized, current_normalized, reference_util;
    real reference_normalized_sum, current_normalized_sum, reference_util_sum;
    real current_spatial_sum, current_temporal_sum, current_total_sum;
 
-   if (!HasComparablePrefetchReference) begin
-     $display(" A512/B448 prefetch comparison omitted: current parameters differ from the selected A688/B256/C64, MReuse8 configuration.");
+   if (!HasComparableMReuse16Reference) begin
+     $display(" A688/MReuse16 comparison omitted: arithmetic or array size differs from the 512-MAC reference.");
      return;
    end
    for (int unsigned c = 0; c < NumWorkloads; c++) begin
      if (case_errors[c] != 0) begin
-       $display(" A512/B448 prefetch comparison INVALID: a required workload failed.");
+       $display(" A688/MReuse16 comparison INVALID: a required workload failed.");
        return;
      end
    end
@@ -1519,18 +1633,18 @@ module tb_mac_array_gemm;
    current_temporal_sum = 0.0;
    current_total_sum = 0.0;
 
-   $display("\n COMPARISON -- saved A512/B448 prefetch reference versus current A688/B256 run");
-   $display(" Reference: A/B/C=512/448/64 bits, MReuse=8, with GeMV prefetch.");
+   $display("\n COMPARISON -- saved A688/B256/C64 MReuse16 reference versus current mapping");
+   $display(" Reference: A/B/C=688/256/64 bits, MReuse=16 rows, 1 M x16 N x32 K, GeMV prefetch.");
    $display(" %s | %10s | %10s | %16s | %16s",
             pad("Case", 14), "Cycles ref", "Cycles now", "Cycles/MKN ref", "Cycles/MKN now");
    for (int unsigned c = 0; c < NumWorkloads; c++) begin
      operations = real'(test_cases[c].M) * real'(test_cases[c].K) * real'(test_cases[c].N);
-     reference_normalized = real'(PreviousPrefetchCycles[c]) / operations;
+     reference_normalized = real'(PreviousMReuse16Cycles[c]) / operations;
      current_normalized = real'(case_cycles[c]) / operations;
      reference_normalized_sum += reference_normalized;
      current_normalized_sum += current_normalized;
      $display(" %s | %10d | %10d | %16.9f | %16.9f",
-              pad(test_cases[c].name, 14), PreviousPrefetchCycles[c], case_cycles[c],
+              pad(test_cases[c].name, 14), PreviousMReuse16Cycles[c], case_cycles[c],
               reference_normalized, current_normalized);
    end
 
@@ -1538,7 +1652,7 @@ module tb_mac_array_gemm;
             pad("Case", 14), "Spatial ref", "Spatial now", "Temp. ref", "Temp. now", "Total ref", "Total now");
    for (int unsigned c = 0; c < NumWorkloads; c++) begin
      operations = real'(test_cases[c].M) * real'(test_cases[c].K) * real'(test_cases[c].N);
-     reference_util = 100.0 * operations / (512.0 * real'(PreviousPrefetchCycles[c]));
+     reference_util = 100.0 * operations / (512.0 * real'(PreviousMReuse16Cycles[c]));
      reference_util_sum += reference_util;
      current_spatial_sum += case_spatial_util[c];
      current_temporal_sum += case_temporal_util[c];
@@ -1551,10 +1665,10 @@ module tb_mac_array_gemm;
             pad("Mean", 14), 100.0, current_spatial_sum / real'(NumWorkloads),
             reference_util_sum / real'(NumWorkloads), current_temporal_sum / real'(NumWorkloads),
             reference_util_sum / real'(NumWorkloads), current_total_sum / real'(NumWorkloads));
-   $display(" A512/B448 prefetch mean normalized latency: reference=%.9f, current=%.9f cycles/MAC.",
+   $display(" A688/MReuse16 mean normalized latency: reference=%.9f, current=%.9f cycles/MAC.",
             reference_normalized_sum / real'(NumWorkloads),
             current_normalized_sum / real'(NumWorkloads));
-   $display(" Measured reduction versus saved A512/B448 prefetch: %0.2f%% (positive is better).",
+   $display(" Measured reduction versus saved A688/MReuse16: %0.2f%% (positive is better).",
             100.0 * (1.0 - current_normalized_sum / reference_normalized_sum));
  endtask
 
@@ -1654,17 +1768,21 @@ module tb_mac_array_gemm;
 
    end
 
-   print_prefetch_comparison();
+   print_mreuse16_comparison();
 
    $display("\n REUSE / OUTPUT-BANDWIDTH DIAGNOSTICS -- six required workloads");
    $display(" %s | %10s | %10s | %10s | %10s | %10s",
-            pad("Case", 14), "B no reuse", "B measured", "C writes", "C stalls", "Queue peak");
+            pad("Case", 14), "B no temp.", "B measured", "C writes", "C stalls", "Queue peak");
    for (int unsigned c = 0; c < NumWorkloads; c++) begin
      $display(" %s | %10d | %10d | %10d | %10d | %10d",
               pad(test_cases[c].name, 14),
-              expected_b_reads(test_cases[c].M, test_cases[c].K, test_cases[c].N, 1),
+              expected_b_reads(test_cases[c].M, test_cases[c].K, test_cases[c].N, GemmRows),
               case_b_reads[c], case_c_writes[c], case_output_stalls[c], case_queue_peak[c]);
    end
+   $display(" %s | %16s | %16s", pad("Case", 14), "B/compute overlap", "B bank switches");
+   for (int unsigned c = 0; c < NumWorkloads; c++)
+     $display(" %s | %16d | %16d", pad(test_cases[c].name, 14),
+              case_b_overlap_cycles[c], case_b_bank_switches[c]);
    if (HasComparableBaseline && (workload_failures == 0)) begin
      $display(" Original mean normalized latency: %.9f cycles/MAC.",
               baseline_normalized_sum / real'(NumWorkloads));

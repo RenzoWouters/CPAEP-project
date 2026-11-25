@@ -7,11 +7,13 @@
 // - Each K step advances by NumInputs (32) elements along K.
 // - When N_size_i == 1 (GeMV), NumCores (16) cores process 16 rows of M
 //   in parallel (M ceiling = ceil(M_size_i / 16), M_count_o stepped by 16).
-// - When N_size_i > 1 (GeMM), NumCores (16) cores process 16 columns of N
-//   in parallel. Up to MReuse rows share each loaded B tile. The loop order is
-//   M group -> N group -> K block -> row within the M group.
-//   M_count_o is the actual row, including the row-within-group offset.
-// - MReuse=1 preserves the original controller's sequence.
+// - When N_size_i > 1 (GeMM), the cores process GemmRows M rows and
+//   NumCores/GemmRows N columns in parallel (2 M x 8 N by default).
+//   MReuse is the number of M ROWS sharing a B tile, not the number of
+//   accumulator contexts. MReuse=64 and GemmRows=2 require 32 contexts.
+//   The loop order is M group -> N group -> K block -> row-pair context.
+//   M_count_o is the base M row of the accepted row pair.
+// - GemmRows=1, MReuse=1 preserves the original controller's sequence.
 //
 // input_valid_i accepts ONE COMPLETE operand block, already loaded by the top.
 // mem_re_o is the accepted-block pulse, not a physical SRAM read enable.
@@ -24,7 +26,8 @@ module gemm_controller_mac_array #(
   parameter int unsigned AddrWidth = 16,
   parameter int unsigned NumCores  = 16,
   parameter int unsigned NumInputs = 32,
-  parameter int unsigned MReuse    = 1
+  parameter int unsigned MReuse    = 64,
+  parameter int unsigned GemmRows  = 2
 )(
   input  logic                   clk_i,
   input  logic                   rst_ni,
@@ -63,10 +66,13 @@ module gemm_controller_mac_array #(
   logic [AddrWidth-1:0] n_step_count;
   logic [AddrWidth-1:0] m_step_count;
 
-  // The ceiling must represent MReuse itself, not only MReuse-1.
-  localparam int unsigned RowWidth = (MReuse <= 1) ? 1 : $clog2(MReuse + 1);
+  localparam int unsigned GemmCols = (GemmRows == 0) ? 1 : NumCores/GemmRows;
+  localparam int unsigned NumContexts = (GemmRows == 0) ? 1 : MReuse/GemmRows;
+  // A ceiling must represent NumContexts itself, not only NumContexts-1.
+  localparam int unsigned RowWidth = (NumContexts <= 1) ? 1 : $clog2(NumContexts + 1);
+  localparam int unsigned CalcWidth = ((AddrWidth > 32) ? AddrWidth : 32) + 1;
   logic [RowWidth-1:0] row_step_count, row_ceiling;
-  logic [AddrWidth-1:0] m_group_base, rows_remaining;
+  logic [CalcWidth-1:0] m_group_base, rows_remaining, rows_in_group;
 
   // Ceilings (number of steps per dimension)
   logic [AddrWidth-1:0] k_ceiling;
@@ -97,55 +103,67 @@ module gemm_controller_mac_array #(
   assign busy_o = (current_state == ControllerBusy  ) ||
                   (current_state == ControllerDrain ) ||
                   (current_state == ControllerFinish);
+  // Keep acceptance independent of the next-state calculation. Terminal
+  // counter pulses feed next_state, but never feed acceptance back into itself.
+  assign move_counter = input_valid_i &&
+    ((current_state == ControllerBusy) ||
+     ((current_state == ControllerIdle) && start_i));
+
+  // Division plus remainder avoids a size+(span-1) overflow at the largest
+  // representable M/K/N. The span is widened too, so narrow size ports do not
+  // truncate a design-time parallelism constant to zero.
+  function automatic logic [AddrWidth-1:0] ceil_steps(
+    input logic [AddrWidth-1:0] size,
+    input int unsigned span
+  );
+    logic [CalcWidth-1:0] wide_size, wide_span;
+    wide_size = CalcWidth'(size);
+    wide_span = CalcWidth'((span == 0) ? 1 : span);
+    if (size == '0) return AddrWidth'(1);
+    return AddrWidth'((wide_size / wide_span) +
+                      CalcWidth'((wide_size % wide_span) != '0));
+  endfunction
 
   //-----------------------
   // Ceilings for 16 cores x 32 inputs
   //-----------------------
   always_comb begin
-    m_group_base = m_step_count * AddrWidth'(MReuse);
-    rows_remaining = M_size_i - m_group_base;
+    m_group_base = is_gemv ? '0 : CalcWidth'(m_step_count) * CalcWidth'(MReuse);
+    rows_remaining = CalcWidth'(M_size_i) - m_group_base;
+    rows_in_group = (rows_remaining < CalcWidth'(MReuse)) ?
+                     rows_remaining : CalcWidth'(MReuse);
     row_ceiling = RowWidth'(1);
     // K advances by NumInputs (32) per step
-    k_ceiling = (K_size_i + AddrWidth'(NumInputs - 1)) / AddrWidth'(NumInputs);
-    if (k_ceiling == '0) begin
-      k_ceiling = {{(AddrWidth-1){1'b0}}, 1'b1};
-    end
+    k_ceiling = ceil_steps(K_size_i, NumInputs);
 
     if (is_gemv) begin
       // GeMV: 16 cores compute 16 rows of M in parallel; N is 1
-      m_ceiling = (M_size_i + AddrWidth'(NumCores - 1)) / AddrWidth'(NumCores);
-      if (m_ceiling == '0) begin
-        m_ceiling = {{(AddrWidth-1){1'b0}}, 1'b1};
-      end
+      m_ceiling = ceil_steps(M_size_i, NumCores);
       n_ceiling = {{(AddrWidth-1){1'b0}}, 1'b1};
     end else begin
-      // GeMM: one M group contains up to MReuse independently accumulated rows.
-      m_ceiling = (M_size_i + AddrWidth'(MReuse - 1)) / AddrWidth'(MReuse);
-      if (m_ceiling == '0) m_ceiling = AddrWidth'(1);
-      row_ceiling = (rows_remaining < AddrWidth'(MReuse)) ?
-                    RowWidth'(rows_remaining) : RowWidth'(MReuse);
+      // A context represents GemmRows independently accumulated rows. Only
+      // the final M group may have fewer contexts or a partially valid pair.
+      m_ceiling = ceil_steps(M_size_i, MReuse);
+      row_ceiling = RowWidth'(ceil_steps(AddrWidth'(rows_in_group), GemmRows));
       if (row_ceiling == '0) row_ceiling = RowWidth'(1);
-      n_ceiling = (N_size_i + AddrWidth'(NumCores - 1)) / AddrWidth'(NumCores);
-      if (n_ceiling == '0) begin
-        n_ceiling = {{(AddrWidth-1){1'b0}}, 1'b1};
-      end
+      n_ceiling = ceil_steps(N_size_i, GemmCols);
     end
   end
 
   // Convert step indices to element offsets
   assign K_count_o = k_step_count * AddrWidth'(NumInputs);
   assign M_count_o = is_gemv ? (m_step_count * AddrWidth'(NumCores)) :
-                             (m_group_base + AddrWidth'(row_step_count));
-  assign N_count_o = is_gemv ? n_step_count : (n_step_count * AddrWidth'(NumCores));
+                    AddrWidth'(m_group_base + CalcWidth'(row_step_count)*CalcWidth'(GemmRows));
+  assign N_count_o = is_gemv ? n_step_count : (n_step_count * AddrWidth'(GemmCols));
 
   //-----------------------
   // Counters for M, K, N steps
   //-----------------------
 
-  // Reuse a GeMM B tile for every row in the current M group before K advances.
+  // Reuse a GeMM B tile for every row pair in the M group before K advances.
   // In GeMV row_ceiling is one, so every accepted block still advances K.
   generate
-    if (MReuse == 1) begin : gen_one_row
+    if (NumContexts <= 1) begin : gen_one_row
       assign row_step_count = '0;
       assign move_K_counter = move_counter;
     end else begin : gen_reuse_rows
@@ -182,7 +200,7 @@ module gemm_controller_mac_array #(
     .last_value_o ( move_N_counter )
   );
 
-  // N Step Counter (each step = 16 columns in GeMM, 1 in GeMV)
+  // N Step Counter (each step = GemmCols columns in GeMM, 1 in GeMV)
   ceiling_counter #(
     .Width        ( AddrWidth  ),
     .HasCeiling   ( 1          )
@@ -222,8 +240,8 @@ module gemm_controller_mac_array #(
     end else begin
       data_valid_q   <= move_counter;
       first_k_q      <= move_counter && (k_step_count == '0);
-      // Every row has a result at its last K block. K only wraps after the
-      // final row, so move_N_counter alone would miss the other row results.
+      // Every row pair has results at its last K block. K only wraps after
+      // the final context, so move_N_counter would miss earlier pair results.
       last_k_q       <= move_counter && (k_step_count == k_ceiling - AddrWidth'(1));
       result_valid_q <= last_k_q;
     end
@@ -248,19 +266,16 @@ module gemm_controller_mac_array #(
   always_comb begin
     next_state     = current_state;
     clear_counters = 1'b0;
-    move_counter   = 1'b0;
     done_o         = 1'b0;
 
     case (current_state)
       ControllerIdle: begin
         if (start_i) begin
-          move_counter = input_valid_i;
           next_state   = last_counter_last_value ? ControllerDrain : ControllerBusy;
         end
       end
 
       ControllerBusy: begin
-        move_counter = input_valid_i;
         if (last_counter_last_value) begin
           next_state = ControllerDrain;
         end
@@ -284,8 +299,11 @@ module gemm_controller_mac_array #(
 
   // synthesis translate_off
   initial begin
-    if (MReuse == 0 || NumCores == 0 || NumInputs == 0)
+    if (MReuse == 0 || NumCores == 0 || NumInputs == 0 || GemmRows == 0 || AddrWidth == 0)
       $fatal(1, "Controller dimensions must be positive.");
+    if (GemmRows > NumCores || (NumCores % GemmRows) != 0 ||
+        (MReuse % GemmRows) != 0)
+      $fatal(1, "GemmRows must divide both NumCores and MReuse.");
   end
   // synthesis translate_on
 

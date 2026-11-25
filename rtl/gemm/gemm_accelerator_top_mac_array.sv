@@ -11,6 +11,8 @@
 // A slot/B bank may be requested again on its last accepted issue: the old
 // operand is consumed at the next edge BEFORE the replacement response's NBA.
 // Explicit MAC bank/slot registers preserve that one-edge ownership extension.
+// The C FIFO holds 25 output groups by default, independently of the 32
+// accumulator contexts. Its pointers wrap explicitly at OutputQueueDepth-1.
 //
 // GeMV retains 16 M rows x 32 K lanes. Its A tiles form one compact stream:
 // thirteen 512-byte tiles occupy 64 A832 words, instead of 65 padded words.
@@ -43,7 +45,8 @@ module gemm_accelerator_top_mac_array #(
   parameter int unsigned SramBDataWidth = 64,
   parameter int unsigned SramCDataWidth = 128,
   parameter int unsigned GemmRows       = 2,
-  parameter int unsigned MReuse         = 64
+  parameter int unsigned MReuse         = 64,
+  parameter int unsigned OutputQueueDepth = 25
 ) (
   input  logic                            clk_i,
   input  logic                            rst_ni,
@@ -83,9 +86,9 @@ module gemm_accelerator_top_mac_array #(
   localparam int unsigned RowCountWidth = $clog2(GemmRows+1);
   localparam int unsigned InputCountWidth = $clog2(NumInputs+1);
   localparam int unsigned ContextWidth = (NumContexts <= 1) ? 1 : $clog2(NumContexts);
-  localparam int unsigned QueueDepth = NumContexts;
+  localparam int unsigned QueueDepth = OutputQueueDepth;
   localparam int unsigned QueuePtrWidth = (QueueDepth <= 1) ? 1 : $clog2(QueueDepth);
-  localparam int unsigned QueueCountWidth = $clog2(QueueDepth+1);
+  localparam int unsigned QueueCountWidth = (QueueDepth <= 1) ? 1 : $clog2(QueueDepth+1);
   localparam int unsigned MaxStep0 = (NumCores > NumInputs) ? NumCores : NumInputs;
   localparam int unsigned MaxStep = (MReuse > MaxStep0) ? MReuse : MaxStep0;
   localparam int unsigned StepWidth = (MaxStep <= 1) ? 1 : $clog2(MaxStep);
@@ -636,6 +639,8 @@ module gemm_accelerator_top_mac_array #(
       $fatal(1, "Each GeMM column tile must contain whole C words.");
     if (SramADataWidth+SramBDataWidth+SramCDataWidth > 1024)
       $fatal(1, "Total physical SRAM port width exceeds 1024 bits.");
+    if (OutputQueueDepth == 0)
+      $fatal(1, "The C output queue must contain at least one entry.");
   end
   always @(posedge clk_i) begin
     if (rst_ni) begin
@@ -662,6 +667,11 @@ module gemm_accelerator_top_mac_array #(
       if (output_queue_used_q > QueueCountWidth'(QueueDepth) ||
           (last_c_write && (output_queue_used_q == '0)))
         $fatal(1, "Output FIFO overflow/underflow.");
+      if ((int'(c_head_q) >= QueueDepth) || (int'(c_tail_q) >= QueueDepth))
+        $fatal(1, "Output FIFO pointer exceeds its configured depth.");
+      for (int stage=0; stage<2; stage++)
+        if (fifo_pending_valid_q[stage] && (int'(fifo_pending_slot_q[stage]) >= QueueDepth))
+          $fatal(1, "Pending output reservation points outside the C FIFO.");
       if (result_valid !== fifo_pending_valid_q[1])
         $fatal(1, "MAC result-valid and output reservation are misaligned.");
       if (result_valid && c_ready_q[fifo_pending_slot_q[1]])

@@ -14,8 +14,9 @@
 // GeMV A tiles form one compact element stream, including logical M/K tails.
 // Only the final A word is padded; each B vector fragment uses four words.
 // C packs four int32 results per word; each GeMM row is padded separately.
-// Compare all six workload metrics against the accepted A832/B64/C128 overlap
-// version, before compact GeMV A packing (same mapping and MReuse=64).
+// Compare all six workload metrics against the accepted compact A832/B64/C128
+// version with 32 output entries. The default queue now has 25 entries, while
+// all 32 accumulator contexts and the compact memory layout are retained.
 // Exact operand traffic/order, nonzero padding, bank switching and backpressure
 // are checked without changing the independent logical-matrix golden model.
 // Phase 1: one initial reset, then all matrix cases without a DUT reset.
@@ -47,6 +48,8 @@ module tb_mac_array_gemm;
  parameter int unsigned GemmRows       = 2;
 
  parameter int unsigned MReuse         = 64;
+
+ parameter int unsigned OutputQueueDepth = 25;
 
  parameter int unsigned SramADataWidth = 832;
 
@@ -127,15 +130,21 @@ module tb_mac_array_gemm;
  localparam int unsigned PreviousC32Cycles [NumWorkloads] =
    '{2077, 2105, 8129, 17300, 61460, 112660};
  localparam bit HasComparableC32Reference = HasComparableBaseline && (MReuse == 4);
- // Accepted A832/B64/C128 overlap version, before compact GeMV A packing.
+ // Accepted compact A832/B64/C128 version with a 32-entry output queue.
  // These are measured comparison values, not expected results or assertions.
- localparam int unsigned PreviousOverlapCycles [NumWorkloads] =
-   '{582, 646, 2438, 8649, 30729, 56329};
+ localparam int unsigned PreviousQueue32Cycles [NumWorkloads] =
+   '{582, 646, 2438, 8517, 30257, 55463};
  // Other parameter choices remain comparable on the same six logical workloads
  // and 512 int8/int32 MAC lanes; the printed reference states its fixed settings.
- localparam bit HasComparableOverlapReference =
+ localparam bit HasComparableQueue32Reference =
    (NumCores == 16) && (NumInputs == 32) &&
    (InDataWidth == 8) && (OutDataWidth == 32);
+ localparam real PreviousQueue32Area = 2775.71875;
+ localparam bit HasComparableQueue32Area = HasComparableQueue32Reference &&
+   (GemmRows == 2) && (MReuse == 64) &&
+   (SramADataWidth == 832) && (SramBDataWidth == 64) && (SramCDataWidth == 128) &&
+   (DataDepthA == 131072) && (DataDepthB == 4096) && (DataDepthC == 4096) &&
+   (AddrWidth == 17) && (SizeAddrWidth == 12);
 
  typedef enum int unsigned {
    ResetTopStart,
@@ -336,6 +345,12 @@ module tb_mac_array_gemm;
  longint unsigned b_overlap_cycles, b_bank_switches;
  bit previous_b_bank, seen_gemm_issue;
 
+ // Observe the non-power-of-two queue boundary in the existing regression.
+ // These counters cover phase 1 only; directed resets are checked separately.
+ bit queue_observation_active;
+ bit expect_head_wrap, expect_tail_wrap;
+ longint unsigned queue_head_wraps, queue_tail_wraps, queue_full_replacements;
+
  bit monitor_active, case_finished;
 
  bit expect_reset_quiet;
@@ -469,6 +484,8 @@ module tb_mac_array_gemm;
    .AddrWidth(AddrWidth), .SizeAddrWidth(SizeAddrWidth),
 
    .NumCores(NumCores), .NumInputs(NumInputs), .GemmRows(GemmRows), .MReuse(MReuse),
+
+   .OutputQueueDepth(OutputQueueDepth),
 
    .SramADataWidth(SramADataWidth), .SramBDataWidth(SramBDataWidth),
 
@@ -1307,7 +1324,7 @@ module tb_mac_array_gemm;
          if (i_dut.valid_data) mac_compute_cycles++;
          if ($isunknown({i_dut.output_stall, i_dut.output_queue_used_q}))
            $fatal(1, "[%0s] Unknown output queue/backpressure state.", active_case_name);
-         if (int'(i_dut.output_queue_used_q) > NumContexts)
+         if (int'(i_dut.output_queue_used_q) > OutputQueueDepth)
            $fatal(1, "[%0s] Output queue reservations exceed capacity.", active_case_name);
          // Count actual blocked issues; a busy C port alone is not a stall.
          if (i_dut.output_stall) output_stall_cycles++;
@@ -1394,6 +1411,30 @@ module tb_mac_array_gemm;
 
  end
 
+ // Sample accepted queue operations before NBA. On the next edge, require
+ // the pointer to have wrapped to zero, including simultaneous pop/reserve.
+ always @(posedge clk_i) begin
+   if (!rst_ni || !queue_observation_active) begin
+     expect_head_wrap = 1'b0;
+     expect_tail_wrap = 1'b0;
+   end else begin
+     if (expect_head_wrap && (i_dut.c_head_q !== '0))
+       $fatal(1, "Output queue head did not wrap at the configured depth.");
+     if (expect_tail_wrap && (i_dut.c_tail_q !== '0))
+       $fatal(1, "Output queue tail did not wrap at the configured depth.");
+     expect_head_wrap = monitor_active && !case_finished && i_dut.last_c_write &&
+                        (int'(i_dut.c_head_q) == OutputQueueDepth-1);
+     expect_tail_wrap = monitor_active && !case_finished && i_dut.reserve_output &&
+                        (int'(i_dut.c_tail_q) == OutputQueueDepth-1);
+     if (expect_head_wrap) queue_head_wraps++;
+     if (expect_tail_wrap) queue_tail_wraps++;
+     if (monitor_active && !case_finished &&
+         (int'(i_dut.output_queue_used_q) == OutputQueueDepth) &&
+         i_dut.last_c_write && i_dut.reserve_output)
+       queue_full_replacements++;
+   end
+ end
+
  //---------------------------
 
  // Clock and sequence driver
@@ -1427,6 +1468,10 @@ module tb_mac_array_gemm;
    active_case_name = "startup";
    expect_reset_quiet = 1'b0;
    reset_cases_passed = 0;
+   queue_observation_active = 1'b1;
+   queue_head_wraps = 0;
+   queue_tail_wraps = 0;
+   queue_full_replacements = 0;
 
    a_used_words = 0;
 
@@ -1464,6 +1509,8 @@ module tb_mac_array_gemm;
    $display("Random seed: 0x%08h", RandomSeed);
    $display("GeMM mapping=%0d M x%0d N x%0d K; MReuse=%0d rows, %0d contexts.",
             GemmRows, GemmCols, NumInputs, MReuse, NumContexts);
+   $display("Output queue capacity: %0d groups (independent of the %0d accumulator contexts).",
+            OutputQueueDepth, NumContexts);
    $display("Fixed SRAM widths A/B/C=%0d/%0d/%0d bits for every workload.",
             SramADataWidth, SramBDataWidth, SramCDataWidth);
    $display("GeMV A packing: continuous %0d-element tiles; one physical word may span two tiles.",
@@ -1582,7 +1629,7 @@ module tb_mac_array_gemm;
                 b_reads, expected_b_reads(M_i, K_i, N_i, GemmRows),
                 (b_reads != 0) ? real'(expected_b_reads(M_i, K_i, N_i, GemmRows)) / real'(b_reads) : 0.0);
        $display("  C backpressure: %0d blocked issue cycles; peak output groups reserved=%0d/%0d.",
-                output_stall_cycles, output_queue_peak, NumContexts);
+                output_stall_cycles, output_queue_peak, OutputQueueDepth);
        if (N_i != 1)
          $display("  B overlap: %0d read/compute cycles; %0d accepted bank switches.",
                   b_overlap_cycles, b_bank_switches);
@@ -1624,6 +1671,12 @@ module tb_mac_array_gemm;
      clk_delay(8);
 
    end
+
+   queue_observation_active = 1'b0;
+   if (HasComparableQueue32Area && (OutputQueueDepth == 25) &&
+       ((queue_head_wraps == 0) || (queue_tail_wraps == 0) ||
+        (queue_full_replacements == 0)))
+     $fatal(1, "The default queue regression missed wraparound or full-queue replacement.");
 
    // Normal-case results are already saved. Reset tests add code coverage
    // on this SAME DUT instance, without changing the project latency score.
@@ -1671,18 +1724,18 @@ module tb_mac_array_gemm;
  // Compare all five requested metrics for each of the six required workloads.
  // The saved reference uses all 512 lanes on every accepted compute cycle,
  // so its spatial utilization is 100% and temporal equals total utilization.
- task automatic print_overlap_comparison();
+ task automatic print_queue32_comparison();
    real operations, reference_normalized, current_normalized, reference_util;
    real reference_normalized_sum, current_normalized_sum, reference_util_sum;
    real current_spatial_sum, current_temporal_sum, current_total_sum;
 
-   if (!HasComparableOverlapReference) begin
-     $display(" A832 overlap comparison omitted: arithmetic or array size differs from the 512-MAC reference.");
+   if (!HasComparableQueue32Reference) begin
+     $display(" Compact Q32 comparison omitted: arithmetic or array size differs from the 512-MAC reference.");
      return;
    end
    for (int unsigned c = 0; c < NumWorkloads; c++) begin
      if (case_errors[c] != 0) begin
-       $display(" A832 overlap comparison INVALID: a required workload failed.");
+       $display(" Compact Q32 comparison INVALID: a required workload failed.");
        return;
      end
    end
@@ -1694,18 +1747,18 @@ module tb_mac_array_gemm;
    current_temporal_sum = 0.0;
    current_total_sum = 0.0;
 
-   $display("\n COMPARISON -- saved A832 overlap reference versus compact GeMV A stream");
-   $display(" Reference: A/B/C=832/64/128 bits, MReuse=64 rows, 2 M x8 N x32 K; GeMV A padded per tile.");
+   $display("\n COMPARISON -- saved compact Q32 reference versus current output queue");
+   $display(" Reference: A/B/C=832/64/128 bits, MReuse=64 rows, 2 M x8 N x32 K; compact GeMV A; output queue=32.");
    $display(" %s | %10s | %10s | %16s | %16s",
             pad("Case", 14), "Cycles ref", "Cycles now", "Cycles/MKN ref", "Cycles/MKN now");
    for (int unsigned c = 0; c < NumWorkloads; c++) begin
      operations = real'(test_cases[c].M) * real'(test_cases[c].K) * real'(test_cases[c].N);
-     reference_normalized = real'(PreviousOverlapCycles[c]) / operations;
+     reference_normalized = real'(PreviousQueue32Cycles[c]) / operations;
      current_normalized = real'(case_cycles[c]) / operations;
      reference_normalized_sum += reference_normalized;
      current_normalized_sum += current_normalized;
      $display(" %s | %10d | %10d | %16.9f | %16.9f",
-              pad(test_cases[c].name, 14), PreviousOverlapCycles[c], case_cycles[c],
+              pad(test_cases[c].name, 14), PreviousQueue32Cycles[c], case_cycles[c],
               reference_normalized, current_normalized);
    end
 
@@ -1713,7 +1766,7 @@ module tb_mac_array_gemm;
             pad("Case", 14), "Spatial ref", "Spatial now", "Temp. ref", "Temp. now", "Total ref", "Total now");
    for (int unsigned c = 0; c < NumWorkloads; c++) begin
      operations = real'(test_cases[c].M) * real'(test_cases[c].K) * real'(test_cases[c].N);
-     reference_util = 100.0 * operations / (512.0 * real'(PreviousOverlapCycles[c]));
+     reference_util = 100.0 * operations / (512.0 * real'(PreviousQueue32Cycles[c]));
      reference_util_sum += reference_util;
      current_spatial_sum += case_spatial_util[c];
      current_temporal_sum += case_temporal_util[c];
@@ -1726,10 +1779,10 @@ module tb_mac_array_gemm;
             pad("Mean", 14), 100.0, current_spatial_sum / real'(NumWorkloads),
             reference_util_sum / real'(NumWorkloads), current_temporal_sum / real'(NumWorkloads),
             reference_util_sum / real'(NumWorkloads), current_total_sum / real'(NumWorkloads));
-   $display(" A832 overlap mean normalized latency: reference=%.9f, current=%.9f cycles/MAC.",
+   $display(" Compact Q32 mean normalized latency: reference=%.9f, current=%.9f cycles/MAC.",
             reference_normalized_sum / real'(NumWorkloads),
             current_normalized_sum / real'(NumWorkloads));
-   $display(" Measured reduction versus saved A832 overlap: %0.2f%% (positive is better).",
+   $display(" Measured reduction versus saved compact Q32: %0.2f%% (positive is better).",
             100.0 * (1.0 - current_normalized_sum / reference_normalized_sum));
  endtask
 
@@ -1829,7 +1882,7 @@ module tb_mac_array_gemm;
 
    end
 
-   print_overlap_comparison();
+   print_queue32_comparison();
 
    $display("\n A-STREAM DIAGNOSTICS -- six required workloads at the current A word width");
    $display(" %s | %12s | %12s | %12s",
@@ -1872,6 +1925,18 @@ module tb_mac_array_gemm;
    end
 
    $display(" Logged area: %0.2f area units", metrics_pkg::area);
+
+   if (HasComparableQueue32Area) begin
+     $display(" Compact Q32 area reference: %0.5f; current Q%0d: %0.5f area units.",
+              PreviousQueue32Area, OutputQueueDepth, metrics_pkg::area);
+     $display(" Measured area reduction versus compact Q32: %0.2f%% (%0.5f area units).",
+              100.0 * (1.0 - metrics_pkg::area / PreviousQueue32Area),
+              PreviousQueue32Area - metrics_pkg::area);
+   end else begin
+     $display(" Compact Q32 area comparison omitted: other area-sensitive parameters differ.");
+   end
+   $display(" Queue boundary observations (matrix phase): head wraps=%0d, tail wraps=%0d, full pop/reserve=%0d.",
+            queue_head_wraps, queue_tail_wraps, queue_full_replacements);
 
    $display(" Energy/area totals depend on the metric hooks implemented in the RTL modules.");
 

@@ -4,7 +4,8 @@
 // Each physical read OR write consumes its complete 128-bit bank word.
 // Phase 1: all matrix jobs, including all six random-data reruns, without reset.
 // Phase 2: directed abort/reset/restart tests on the SAME DUT and memories.
-// Phase 3: post-report SRAM checks, including an explicit protocol-negative test.
+// Phase 3: SRAM checks, including an explicit protocol-negative test.
+// Final report: only the six required workloads and the complete test status.
 // Logical row-major golden matrices are independent of the banked layout.
 //-----------------------------------------------------------------------------
 module tb_mac_array_gemm;
@@ -44,9 +45,6 @@ module tb_mac_array_gemm;
   localparam int unsigned GemmCElements = 2*BankResults;
   localparam int unsigned NumWorkloads = 6;
   localparam int unsigned NumCases = 81;
-  localparam int unsigned PreviousCycles[NumWorkloads] =
-    '{302, 558, 2350, 6971, 24686, 45166};
-  localparam real PreviousArea = 3068.09375;
 
   typedef struct {
     string name;
@@ -883,7 +881,6 @@ module tb_mac_array_gemm;
     if(target==ResetFragmentReload) begin ak=GemvFragmentElements+1;am=NumCores+1;end
     M_i=SizeAddrWidth'(am); K_i=SizeAddrWidth'(ak); N_i=SizeAddrWidth'(an);
     initialize_memories(0,am,ak,an,1'b1); maximum=timeout_cycles(am,ak,an);waited=0;
-    $display("\n[RESET %0s] Abort job M=%0d K=%0d N=%0d.",label_text,am,ak,an);
     @(negedge clk_i);
     if(done!==1'b0) $fatal(1,"done high before reset test.");
     monitor_active=1;case_finished=0;start=1;
@@ -913,11 +910,10 @@ module tb_mac_array_gemm;
     if(recovery_errors!=0) $fatal(1,"[%0s] Recovery result failed.",active_case_name);
     repeat(2) begin clk_delay(1);if(done!==1'b0) $fatal(1,"Recovery done must pulse once.");end
     monitor_active=0;case_finished=0;reset_cases_passed++;
-    $display("[RESET %0s] PASS: C preserved; opposite-mode recovery correct (%0d cycles).",label_text,recovery_cycles);
   endtask
 
   task automatic run_reset_tests();
-    $display("\nPHASE 2: RESET / ABORT / RESTART TESTS");reset_cases_passed=0;
+    reset_cases_passed=0;
     for(int mode=0;mode<2;mode++)
       for(int r=0;r<NumResetTargets;r++) run_reset_case(reset_target_t'(r),mode==1);
     run_reset_case(ResetPrefetchPending,1);
@@ -931,10 +927,10 @@ module tb_mac_array_gemm;
   endtask
 
   //---------------------------------------------------------------------------
-  // Phase 3: SRAM coverage after the complete accelerator performance report.
+  // Phase 3: SRAM coverage after the matrix and reset/restart tests.
   // Normal accesses remain half-duplex. One explicitly marked negative cycle
   // exercises the unchanged SRAM module's simultaneous read/write $error check.
-  // scripts/check_sram_negative_log.py checks the eight expected diagnostics.
+  // The markers identify the eight expected SRAM diagnostics in the transcript.
   //---------------------------------------------------------------------------
   always @(posedge clk_i) begin : monitor_sram_override
     int unsigned active_banks;
@@ -984,9 +980,6 @@ module tb_mac_array_gemm;
   task automatic run_sram_coverage_exercise();
     logic [BankDataWidth-1:0] pat;
     logic [NumBanks-1:0][BankDataWidth-1:0] held_rdata;
-    $display("\n==========================================");
-    $display(" PHASE 3: BANKED SRAM COVERAGE EXERCISE");
-    $display("==========================================");
 
     @(negedge clk_i);
     if (rst_ni !== 1'b1 || i_dut.state_q !== i_dut.TopIdle ||
@@ -1054,7 +1047,7 @@ module tb_mac_array_gemm;
 
     // Negative test: exactly one active edge with RE=WE=1 on every bank.
     // These are testbench-generated invalid requests, never accelerator traffic.
-    // Do not suppress or modify the SRAM $errors: the log checker must observe
+    // Do not suppress or modify the SRAM $errors: the transcript must contain
     // exactly one original error from each bank, and no unrelated errors.
     @(negedge clk_i);
     sram_negative_active = 1'b1;
@@ -1109,8 +1102,6 @@ module tb_mac_array_gemm;
     sram_tb_override = 1'b0;
     @(posedge clk_i); #1;
     check_reset_idle("after SRAM coverage exercise");
-    $display("[SRAM COV] PASS: all %0d banks passed read/write, latency, hold and reset checks.", NumBanks);
-    $display("[SRAM NEGATIVE] Stimulus completed; expected-error log check required.");
   endtask
 
   function automatic string pad(input string str,input int unsigned width);
@@ -1118,69 +1109,38 @@ module tb_mac_array_gemm;
     return str;
   endfunction
 
-  task automatic print_comparison();
-    real ops,ref_norm,now_norm,ref_util,ref_sum,now_sum,ref_util_sum;
-    real spatial_sum,temporal_sum,total_sum;
-    ref_sum=0;now_sum=0;ref_util_sum=0;spatial_sum=0;temporal_sum=0;total_sum=0;
-    $display("\n COMPARISON -- Q20 full B cache versus current Q%0d B fragments",OutputQueueDepth);
-    $display(" Reference: 8x128-bit banks,2Mx8Nx32K,MReuse64,Q20,2048-byte GeMV B cache.");
-    $display(" %s | %10s | %10s | %16s | %16s",pad("Case",14),"Cycles ref","Cycles now","Cycles/MKN ref","Cycles/MKN now");
-    for(int c=0;c<NumWorkloads;c++) begin
-      ops=real'(test_cases[c].M)*real'(test_cases[c].K)*real'(test_cases[c].N);
-      ref_norm=real'(PreviousCycles[c])/ops;now_norm=real'(case_cycles[c])/ops;
-      ref_sum+=ref_norm;now_sum+=now_norm;
-      $display(" %s | %10d | %10d | %16.9f | %16.9f",pad(test_cases[c].name,14),PreviousCycles[c],case_cycles[c],ref_norm,now_norm);
-    end
-    $display(" %s | %11s | %11s | %11s | %11s | %11s | %11s",pad("Case",14),"Spatial ref","Spatial now","Temp. ref","Temp. now","Total ref","Total now");
-    for(int c=0;c<NumWorkloads;c++) begin
-      ops=real'(test_cases[c].M)*real'(test_cases[c].K)*real'(test_cases[c].N);
-      ref_util=100.0*ops/(512.0*real'(PreviousCycles[c]));ref_util_sum+=ref_util;
-      spatial_sum+=case_spatial_util[c];temporal_sum+=case_temporal_util[c];total_sum+=case_total_util[c];
-      $display(" %s | %10.2f%% | %10.2f%% | %10.2f%% | %10.2f%% | %10.2f%% | %10.2f%%",pad(test_cases[c].name,14),100.0,case_spatial_util[c],ref_util,case_temporal_util[c],ref_util,case_total_util[c]);
-    end
-    $display(" %s | %10.2f%% | %10.2f%% | %10.2f%% | %10.2f%% | %10.2f%% | %10.2f%%",pad("Mean",14),100.0,spatial_sum/NumWorkloads,ref_util_sum/NumWorkloads,temporal_sum/NumWorkloads,ref_util_sum/NumWorkloads,total_sum/NumWorkloads);
-    $display(" Mean normalized latency: reference=%.9f,current=%.9f cycles/MAC.",ref_sum/NumWorkloads,now_sum/NumWorkloads);
-    $display(" Measured reduction versus Q20 full B cache: %0.2f%% (positive is better).",100.0*(1.0-now_sum/ref_sum));
-  endtask
-
   task automatic print_report();
     int unsigned num_failed,workload_failures;
     real normalized,norm_sum,spatial_sum,temporal_sum,total_sum;
     num_failed=0;workload_failures=0;norm_sum=0;spatial_sum=0;temporal_sum=0;total_sum=0;
-    $display("\n===========================================================================================================================================");
-    $display(" RESULTS -- first six rows are the required workloads; remaining rows are extra tests");
-    $display("-------------------------------------------------------------------------------------------------------------------------------------------");
-    $display(" %s | %4s %4s %3s | %8s | %12s | %8s | %9s | %8s | %12s | %12s | %s",pad("Case",14),"M","K","N","Cycles","Cycles/MKN","Spatial","Temporal","Total","Energy","SRAM energy","Check");
-    foreach(test_cases[c]) begin
-      normalized=real'(case_cycles[c])/(real'(test_cases[c].M)*real'(test_cases[c].K)*real'(test_cases[c].N));
-      $display(" %s | %4d %4d %3d | %8d | %12.9f | %7.2f%% | %8.2f%% | %7.2f%% | %12.2f | %12.0f | %s",pad(test_cases[c].name,14),test_cases[c].M,test_cases[c].K,test_cases[c].N,case_cycles[c],normalized,case_spatial_util[c],case_temporal_util[c],case_total_util[c],case_energy[c],case_sram_energy[c],(case_errors[c]==0)?"PASS":"FAIL");
+
+    // Check the complete regression, even though only the scored workloads
+    // appear in the performance table and contribute to its averages.
+    foreach(test_cases[c])
       if(case_errors[c]!=0) num_failed++;
-      if(c<NumWorkloads) begin
-        norm_sum+=normalized;spatial_sum+=case_spatial_util[c];temporal_sum+=case_temporal_util[c];total_sum+=case_total_util[c];
-        if(case_errors[c]!=0) workload_failures++;
-      end
+
+    $display("\n=============================================================================================================");
+    $display(" RESULTS -- six required workloads");
+    $display("-------------------------------------------------------------------------------------------------------------");
+    $display(" %s | %4s %4s %3s | %7s | %11s | %7s | %8s | %7s | %12s | %s",pad("Case",8),"M","K","N","Cycles","Cycles/MKN","Spatial","Temporal","Total","Energy","Check");
+    $display("-------------------------------------------------------------------------------------------------------------");
+    for(int c=0;c<NumWorkloads;c++) begin
+      normalized=real'(case_cycles[c])/(real'(test_cases[c].M)*real'(test_cases[c].K)*real'(test_cases[c].N));
+      $display(" %s | %4d %4d %3d | %7d | %11.9f | %6.2f%% | %7.2f%% | %6.2f%% | %12.2f | %s",pad(test_cases[c].name,8),test_cases[c].M,test_cases[c].K,test_cases[c].N,case_cycles[c],normalized,case_spatial_util[c],case_temporal_util[c],case_total_util[c],case_energy[c],(case_errors[c]==0)?"PASS":"FAIL");
+      norm_sum+=normalized;spatial_sum+=case_spatial_util[c];temporal_sum+=case_temporal_util[c];total_sum+=case_total_util[c];
+      if(case_errors[c]!=0) workload_failures++;
     end
-    $display("-------------------------------------------------------------------------------------------------------------------------------------------");
+    $display("-------------------------------------------------------------------------------------------------------------");
+    $display(" Averages over the six required workloads:");
     if(workload_failures==0) begin
-      $display(" Mean normalized latency (ONLY six required workloads): %.9f cycles/MAC",norm_sum/NumWorkloads);
-      $display(" Mean spatial utilization  (ONLY six required workloads): %0.2f%%",spatial_sum/NumWorkloads);
-      $display(" Mean temporal utilization (ONLY six required workloads): %0.2f%%",temporal_sum/NumWorkloads);
-      $display(" Mean total utilization    (ONLY six required workloads): %0.2f%%",total_sum/NumWorkloads);
-      print_comparison();
+      $display(" Mean normalized latency   : %.9f cycles/MKN",norm_sum/NumWorkloads);
+      $display(" Mean spatial utilization  : %0.2f%%",spatial_sum/NumWorkloads);
+      $display(" Mean temporal utilization : %0.2f%%",temporal_sum/NumWorkloads);
+      $display(" Mean total utilization    : %0.2f%%",total_sum/NumWorkloads);
     end else $display(" Mean normalized latency INVALID: required workload failure.");
-    $display("\n PHYSICAL BANK TRAFFIC -- each counted access transfers one full128-bit word");
-    $display(" %s | %10s | %10s | %10s | %12s | %10s | %10s",pad("Case",14),"A reads","B reads","C writes","C bus cycles","C stalls","Queue peak");
-    for(int c=0;c<NumWorkloads;c++)
-      $display(" %s | %10d | %10d | %10d | %12d | %10d | %10d",pad(test_cases[c].name,14),case_a_reads[c],case_b_reads[c],case_c_writes[c],case_write_cycles[c],case_output_stalls[c],case_queue_peak[c]);
-    $display(" Logged area: %0.2f area units",metrics_pkg::area);
-    $display(" Q20 full-cache area reference: %.5f; current: %.5f; change: %.2f%%.",PreviousArea,metrics_pkg::area,100.0*(metrics_pkg::area/PreviousArea-1.0));
-    $display(" Queue observations: head wraps=%0d,tail wraps=%0d,full pop/reserve=%0d.",queue_head_wraps,queue_tail_wraps,queue_full_replacements);
-    $display(" Bank observations: paired GeMV writes=%0d,GeMV write-pause cycles=%0d,read/write direction switches=%0d.",paired_c_writes,gemv_c_pause_events,bank_direction_switches);
-    $display(" Bank timing observations: paired wrap=%0d,prefetch/C conflict=%0d,pending A response/C overlap=%0d.",paired_queue_wraps,prefetch_write_conflicts,response_write_overlap);
-    $display(" Energy/area totals depend on the metric hooks implemented in the RTL modules.");
-    $display("===========================================================================================================================================\n");
+    $display("\n Area                      : %0.2f area units",metrics_pkg::area);
+    $display("=============================================================================================================\n");
     if(num_failed!=0) $fatal(1,"%0d of%0d cases FAILED.",num_failed,NumCases);
-    $display("All %0d matrix cases passed!",NumCases);
   endtask
 
   initial begin
@@ -1203,19 +1163,13 @@ module tb_mac_array_gemm;
     output_stall_cycles=0;output_queue_peak=0;c_write_cycles=0;b_overlap_cycles=0;b_bank_switches=0;
     previous_b_bank=0;seen_gemm_issue=0;seed_state=RandomSeed;void'($urandom(seed_state));
     repeat(5) @(negedge clk_i);rst_ni=1;clk_delay(1);
-    $display("Random seed:0x%08h",RandomSeed);
-    $display("Fixed physical memory: %0d banks x%0d bits,at most1024bits/cycle,one read OR write perbank.",NumBanks,BankDataWidth);
-    $display("Physical SRAM capacity: %0d bytes (%0d words perbank); unchanged aggregate capacity versus the Q20 full-cache reference.",NumBanks*DataDepth*BankBytes,DataDepth);
-    $display("GeMM mapping=%0dMx%0dNx%0dK,MReuse=%0d,contexts=%0d,output queue=%0d.",GemmRows,GemmCols,NumInputs,MReuse,NumContexts,OutputQueueDepth);
-    $display("GeMV B fragment=%0d int8 elements in existing GeMM A slots; %0d M rows per context group.",GemvFragmentElements,GemvReuseRows);
-    $display("PHASE 1: %0d matrix cases without an intermediate DUT reset.",NumCases);
+    $display("Running %0d matrix cases and %0d reset/restart tests (seed 0x%08h)...",NumCases,NumResetCases,RandomSeed);
     foreach(test_cases[c]) begin
       real ops,peak,compute_slots,total_slots;
       active_case_name=test_cases[c].name;
       M_i=SizeAddrWidth'(test_cases[c].M);K_i=SizeAddrWidth'(test_cases[c].K);N_i=SizeAddrWidth'(test_cases[c].N);
-      $display("\n[%0s] A(%0dx%0d)*B(%0dx%0d)->C(%0dx%0d)",active_case_name,M_i,K_i,K_i,N_i,M_i,N_i);
       initialize_memories(c,test_cases[c].M,test_cases[c].K,test_cases[c].N);
-      $display(" Data pattern: %0s",pattern_name(active_pattern));coverage.sample();
+      coverage.sample();
       gemm_golden(test_cases[c].M,test_cases[c].K,test_cases[c].N);clk_delay(1);
       start_and_wait_gemm(case_cycles[c],case_energy[c],timeout_cycles(test_cases[c].M,test_cases[c].K,test_cases[c].N));
       case_a_reads[c]=a_reads;case_b_reads[c]=b_reads;case_c_writes[c]=c_writes;
@@ -1228,9 +1182,6 @@ module tb_mac_array_gemm;
       case_spatial_util[c]=(compute_slots>0)?100.0*ops/compute_slots:0;
       case_temporal_util[c]=(case_cycles[c]>0)?100.0*real'(mac_compute_cycles)/real'(case_cycles[c]):0;
       case_total_util[c]=(total_slots>0)?100.0*ops/total_slots:0;
-      $display("[%0s] %0s: %0d cycles,%0.2f logged energy units.",active_case_name,(case_errors[c]==0)?"PASS":"FAIL",case_cycles[c],case_energy[c]);
-      $display(" Physical128-bit words:A=%0d,B=%0d,C=%0d;SRAM energy=%0.0f.",a_reads,b_reads,c_writes,case_sram_energy[c]);
-      $display(" Spatial=%0.2f%%,Temporal=%0.2f%%,Total=%0.2f%%;C bus cycles=%0d;queue peak=%0d.",case_spatial_util[c],case_temporal_util[c],case_total_util[c],c_write_cycles,output_queue_peak);
       if(case_errors[c]!=0) $fatal(1,"[%0s] Matrix/check failure.",active_case_name);
       repeat(2) begin clk_delay(1);if(done!==1'b0) $fatal(1,"done must pulse for one cycle.");end
       monitor_active=0;case_finished=0;clk_delay(8);
@@ -1239,21 +1190,11 @@ module tb_mac_array_gemm;
     if(queue_head_wraps==0 || queue_tail_wraps==0 || gemv_c_pause_events==0 || bank_direction_switches==0)
       $fatal(1,"Banked regression missed a required queue/arbitration transition.");
     if(OutputQueueDepth>1 && paired_c_writes==0) $fatal(1,"No paired GeMV write observed.");
-    run_reset_tests();print_report();
+    run_reset_tests();
     if(reset_cases_passed!=NumResetCases) $fatal(1,"Incomplete reset regression.");
-    $display("Reset/restart tests:%0d/%0d PASS.",reset_cases_passed,NumResetCases);
     run_sram_coverage_exercise();
-    $display("\n==========================================\n FUNCTIONAL COVERAGE\n==========================================");
-    $display("Covergroup total: %0.2f%%",coverage.get_coverage());
-    $display("Mode coverage:    %0.2f%%",coverage.cp_mode.get_coverage());
-    $display("K coverage:       %0.2f%%",coverage.cp_K.get_coverage());
-    $display("M coverage:       %0.2f%%",coverage.cp_M.get_coverage());
-    $display("N coverage:       %0.2f%%",coverage.cp_N.get_coverage());
-    $display("Pattern coverage: %0.2f%%",coverage.cp_pattern.get_coverage());
-    $display("Mode x K cross:   %0.2f%%",coverage.mode_k_cross.get_coverage());
-    $display("==========================================");
+    print_report();
     $display("All %0d matrix cases and %0d reset/restart tests passed!",NumCases,reset_cases_passed);
-    $display("[REGRESSION COMPLETE] matrix_cases=%0d reset_tests=%0d sram_positive=PASS negative_stimulus=COMPLETE",NumCases,reset_cases_passed);
     $finish;
   end
 endmodule

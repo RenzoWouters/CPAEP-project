@@ -1,2 +1,0 @@
-var g_data = {"18":["GeMV","GeMM"],"19":["below_32","exact_32","below_60","exact_60","above_60","exact_64","above_64"],"20":["below_16","exact_16","below_32","exact_32","above_32"],"21":["single","below_16","exact_16","below_32","exact_32","above_32"],"22":["random_data","zero_data","positive_data","negative_data","opposite_signs","maximum_value","minimum_value","alternating"]};
-processCoverpointsMapData(g_data);

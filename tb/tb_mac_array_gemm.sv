@@ -1,17 +1,22 @@
 //-----------------------------------------------------------------------------
+
 // Integration testbench for gemm_accelerator_top_mac_array.
+
 // Same structure as tb_one_mac_gemm: SRAMs, case table, golden model, report.
+
 // Expanded boundary, data-pattern and functional-coverage regression.
 // Additional random-data runs cover all six required workload dimensions.
 // MReuse row-bank boundaries, exact B-traffic checks and C-backpressure metrics
 // compare the new GeMM reuse schedule against the preserved original run.
 // C packs two int32 results per 64-bit word by default; GeMM rows are padded
 // independently, while GeMV packs consecutive M results into complete words.
-// A/B/C=704/256/64 bits (1024 bits total) is compared with the saved
-// A512/B448/C64/MReuse8/GeMV8 run and the original baseline.
+// Fixed A/B/C words are 688/256/64 bits for both GeMM and GeMV.
+// GeMM A uses 64 useful bytes plus 22 padding bytes per word; GeMV uses all 86.
+// The A-bandwidth change is compared with the saved A512/B448 prefetch run.
 // Phase 1: one initial reset, then all matrix cases without a DUT reset.
 // Phase 2: directed reset/abort/restart tests on the same DUT and SRAMs.
 // Both phases contribute to the same simulation's code coverage.
+
 //-----------------------------------------------------------------------------
 
 module tb_mac_array_gemm;
@@ -21,7 +26,9 @@ module tb_mac_array_gemm;
  timeprecision 1ps;
 
  //---------------------------
+
  // Design-time parameters
+
  //---------------------------
 
  parameter int unsigned InDataWidth    = 8;
@@ -34,7 +41,7 @@ module tb_mac_array_gemm;
 
  parameter int unsigned MReuse         = 8;
 
- parameter int unsigned SramADataWidth = 704;
+ parameter int unsigned SramADataWidth = 688;
 
  parameter int unsigned SramBDataWidth = 256;
 
@@ -42,6 +49,7 @@ module tb_mac_array_gemm;
 
  parameter int unsigned DataDepthA     = 131072;
 
+ // GeMM 3 occupies 36 B tiles x 16 words = 576 words at B=256 bits.
  parameter int unsigned DataDepthB     = 1024;
 
  parameter int unsigned DataDepthC     = 4096;
@@ -54,6 +62,9 @@ module tb_mac_array_gemm;
 
  localparam int unsigned AElements = SramADataWidth / InDataWidth;
 
+ // GeMM uses whole K blocks per A word; GeMV uses all physical A lanes.
+ localparam int unsigned AGemmElements = (AElements / NumInputs) * NumInputs;
+
  localparam int unsigned BElements = SramBDataWidth / InDataWidth;
 
  localparam int unsigned CElements = SramCDataWidth / OutDataWidth;
@@ -65,7 +76,9 @@ module tb_mac_array_gemm;
  localparam int unsigned BReadWords = (TileElements + BElements - 1) / BElements;
 
  //---------------------------
+
  // Test cases: A[M x K] * B[K x N] = C[M x N]
+
  //---------------------------
 
  typedef struct {
@@ -96,19 +109,22 @@ module tb_mac_array_gemm;
  // compare the same required workloads and arithmetic/array dimensions.
  localparam bit HasComparableBaseline =
    (NumCores == 16) && (NumInputs == 32) &&
-   (InDataWidth == 8) && (OutDataWidth == 32);
+   (InDataWidth == 8) && (OutDataWidth == 32) &&
+   (SramADataWidth == 512);
  // Previous measured MReuse=4 design, with A/B/C=512/480/32 bits.
  localparam int unsigned PreviousC32Cycles [NumWorkloads] =
    '{2077, 2105, 8129, 17300, 61460, 112660};
- localparam bit HasComparableC32Reference = HasComparableBaseline &&
-   (SramADataWidth == 512) && (MReuse == 4);
- // Saved A/B/C=512/448/64, MReuse=8 run with GeMV prefetch (8 cycles/tile).
+ localparam bit HasComparableC32Reference = HasComparableBaseline && (MReuse == 4);
+ // User-confirmed A512/B448/C64, MReuse8 run with GeMV prefetch.
  // These are measured comparison values, not expected results for this run.
- localparam int unsigned PreviousA512Cycles [NumWorkloads] =
+ localparam int unsigned PreviousPrefetchCycles [NumWorkloads] =
    '{1059, 1277, 5533, 13837, 49165, 90125};
- localparam bit HasMatchingA512Reference = HasComparableBaseline &&
-   (MReuse == 8) && (SramADataWidth == 704) &&
-   (SramBDataWidth == 256) && (SramCDataWidth == 64);
+ // A/B widths intentionally differ from the reference; all other scored
+ // arithmetic dimensions and the selected MReuse/C configuration agree.
+ localparam bit HasComparablePrefetchReference =
+   (NumCores == 16) && (NumInputs == 32) &&
+   (InDataWidth == 8) && (OutDataWidth == 32) && (MReuse == 8) &&
+   (SramADataWidth == 688) && (SramBDataWidth == 256) && (SramCDataWidth == 64);
 
  typedef enum int unsigned {
    ResetTopStart,
@@ -166,7 +182,7 @@ module tb_mac_array_gemm;
    // GeMV B-vector packing boundary
    '{"GeMV K60",         16,   60,  1, 2},
 
-   // Maximum A SRAM usage while respecting 12-bit size inputs.
+   // Large GeMV memory case at the maximum 12-bit M dimension.
    // M=4095 is the largest representable dimension (M=4096 would wrap to zero).
    '{"GeMV max SRAM",  4095, 2048,  1, 3},
 
@@ -219,7 +235,9 @@ module tb_mac_array_gemm;
  int unsigned case_queue_peak [NumCases];
 
  //---------------------------
+
  // Wires
+
  //---------------------------
 
  logic clk_i, rst_ni, start, done;
@@ -317,7 +335,9 @@ module tb_mac_array_gemm;
  gemm_coverage coverage = new();
 
  //---------------------------
+
  // The supplied SRAM modules, with fixed widths/depths for ALL cases
+
  //---------------------------
 
  single_port_memory #(
@@ -375,7 +395,9 @@ module tb_mac_array_gemm;
  );
 
  //---------------------------
+
  // DUT instantiation
+
  //---------------------------
 
  gemm_accelerator_top_mac_array #(
@@ -411,12 +433,15 @@ module tb_mac_array_gemm;
  );
 
  //---------------------------
+
  // Tasks and functions
+
  //---------------------------
 
  `include "includes/common_tasks.svh"
 
  // The original test_tasks.svh/test_func.svh assume scalar SRAM words and
+
  // one common DataDepth. Their adapted equivalents are local to this TB.
 
  function automatic string pattern_name(input int unsigned pattern);
@@ -463,7 +488,7 @@ module tb_mac_array_gemm;
 
    k_blocks = (k_sz + NumInputs - 1) / NumInputs;
 
-   a_words_per_row = (k_sz + AElements - 1) / AElements;
+   a_words_per_row = (k_sz + AGemmElements - 1) / AGemmElements;
 
    if (n_sz == 1) begin
 
@@ -588,9 +613,9 @@ module tb_mac_array_gemm;
 
        end else begin
 
-         word_addr = m * a_words_per_row + k / AElements;
+         word_addr = m * a_words_per_row + k / AGemmElements;
 
-         lane = k % AElements;
+         lane = k % AGemmElements;
 
        end
 
@@ -733,6 +758,7 @@ module tb_mac_array_gemm;
    #1;
 
    // Latency is elapsed rising-edge intervals: accepted start is edge zero.
+
    // This matches the counting convention of the provided baseline task.
 
    elapsed_cycles = 0;
@@ -864,6 +890,7 @@ module tb_mac_array_gemm;
  endtask
 
  //---------------------------
+
  // Directed reset tests, run AFTER the normal matrix regression.
  // The target states are observed, never forced. Reset is driven on a negedge.
  //---------------------------
@@ -877,7 +904,7 @@ module tb_mac_array_gemm;
      ResetControllerDrain: return "ControllerDrain";
      ResetDuringCWrite:    return "partial C write in TopDrain";
      ResetPrefetchPending: return "prefetched A/B response pending";
-     default:              return "unknown reset target";
+     default:             return "unknown reset target";
    endcase
  endfunction
 
@@ -929,8 +956,7 @@ module tb_mac_array_gemm;
         i_dut.controller_busy, i_dut.controller_done,
         i_dut.controller_done_seen_q,
         i_dut.a_response_valid_q, i_dut.b_response_valid_q,
-        i_dut.a_cache_valid_q, i_dut.a_prev_valid_q,
-        i_dut.output_slot_busy_q,
+        i_dut.a_cache_valid_q, i_dut.output_slot_busy_q,
         i_dut.c_valid_q, i_dut.output_stall,
         i_dut.output_queue_used_q, i_dut.fifo_pending_valid_q,
         i_dut.c_ready_q} !== '0)
@@ -1090,7 +1116,9 @@ module tb_mac_array_gemm;
 
  //---------------------------
  // Monitor physical SRAM transactions and MAC utilization at rising clock edges.
+
  // Do not sample read data here: it is updated after the edge by the SRAM.
+
  //---------------------------
 
  always @(posedge clk_i) begin
@@ -1205,7 +1233,9 @@ module tb_mac_array_gemm;
  end
 
  //---------------------------
+
  // Clock and sequence driver
+
  //---------------------------
 
  initial begin
@@ -1450,7 +1480,9 @@ module tb_mac_array_gemm;
  end
 
  //---------------------------
+
  // Final report
+
  //---------------------------
 
  function automatic string pad(string str, int unsigned width);
@@ -1464,18 +1496,18 @@ module tb_mac_array_gemm;
  // Compare all five requested metrics for each of the six required workloads.
  // The saved reference uses all 512 lanes on every accepted compute cycle,
  // so its spatial utilization is 100% and temporal equals total utilization.
- task automatic print_a512_comparison();
+ task automatic print_prefetch_comparison();
    real operations, reference_normalized, current_normalized, reference_util;
    real reference_normalized_sum, current_normalized_sum, reference_util_sum;
    real current_spatial_sum, current_temporal_sum, current_total_sum;
 
-   if (!HasMatchingA512Reference) begin
-     $display(" A512/B448/C64 comparison omitted: hardware parameters differ from the saved reference.");
+   if (!HasComparablePrefetchReference) begin
+     $display(" A512/B448 prefetch comparison omitted: current parameters differ from the selected A688/B256/C64, MReuse8 configuration.");
      return;
    end
    for (int unsigned c = 0; c < NumWorkloads; c++) begin
      if (case_errors[c] != 0) begin
-       $display(" A512/B448/C64 comparison INVALID: a required workload failed.");
+       $display(" A512/B448 prefetch comparison INVALID: a required workload failed.");
        return;
      end
    end
@@ -1487,18 +1519,18 @@ module tb_mac_array_gemm;
    current_temporal_sum = 0.0;
    current_total_sum = 0.0;
 
-   $display("\n COMPARISON -- saved A512/B448/C64/MReuse8/GeMV8 reference versus current run");
+   $display("\n COMPARISON -- saved A512/B448 prefetch reference versus current A688/B256 run");
    $display(" Reference: A/B/C=512/448/64 bits, MReuse=8, with GeMV prefetch.");
    $display(" %s | %10s | %10s | %16s | %16s",
             pad("Case", 14), "Cycles ref", "Cycles now", "Cycles/MKN ref", "Cycles/MKN now");
    for (int unsigned c = 0; c < NumWorkloads; c++) begin
      operations = real'(test_cases[c].M) * real'(test_cases[c].K) * real'(test_cases[c].N);
-     reference_normalized = real'(PreviousA512Cycles[c]) / operations;
+     reference_normalized = real'(PreviousPrefetchCycles[c]) / operations;
      current_normalized = real'(case_cycles[c]) / operations;
      reference_normalized_sum += reference_normalized;
      current_normalized_sum += current_normalized;
      $display(" %s | %10d | %10d | %16.9f | %16.9f",
-              pad(test_cases[c].name, 14), PreviousA512Cycles[c], case_cycles[c],
+              pad(test_cases[c].name, 14), PreviousPrefetchCycles[c], case_cycles[c],
               reference_normalized, current_normalized);
    end
 
@@ -1506,7 +1538,7 @@ module tb_mac_array_gemm;
             pad("Case", 14), "Spatial ref", "Spatial now", "Temp. ref", "Temp. now", "Total ref", "Total now");
    for (int unsigned c = 0; c < NumWorkloads; c++) begin
      operations = real'(test_cases[c].M) * real'(test_cases[c].K) * real'(test_cases[c].N);
-     reference_util = 100.0 * operations / (512.0 * real'(PreviousA512Cycles[c]));
+     reference_util = 100.0 * operations / (512.0 * real'(PreviousPrefetchCycles[c]));
      reference_util_sum += reference_util;
      current_spatial_sum += case_spatial_util[c];
      current_temporal_sum += case_temporal_util[c];
@@ -1519,10 +1551,10 @@ module tb_mac_array_gemm;
             pad("Mean", 14), 100.0, current_spatial_sum / real'(NumWorkloads),
             reference_util_sum / real'(NumWorkloads), current_temporal_sum / real'(NumWorkloads),
             reference_util_sum / real'(NumWorkloads), current_total_sum / real'(NumWorkloads));
-   $display(" A512/B448/C64 mean normalized latency: reference=%.9f, current=%.9f cycles/MAC.",
+   $display(" A512/B448 prefetch mean normalized latency: reference=%.9f, current=%.9f cycles/MAC.",
             reference_normalized_sum / real'(NumWorkloads),
             current_normalized_sum / real'(NumWorkloads));
-   $display(" Measured reduction versus saved A512/B448/C64: %0.2f%% (positive is better).",
+   $display(" Measured reduction versus saved A512/B448 prefetch: %0.2f%% (positive is better).",
             100.0 * (1.0 - current_normalized_sum / reference_normalized_sum));
  endtask
 
@@ -1622,7 +1654,7 @@ module tb_mac_array_gemm;
 
    end
 
-   print_a512_comparison();
+   print_prefetch_comparison();
 
    $display("\n REUSE / OUTPUT-BANDWIDTH DIAGNOSTICS -- six required workloads");
    $display(" %s | %10s | %10s | %10s | %10s | %10s",
@@ -1639,7 +1671,7 @@ module tb_mac_array_gemm;
      $display(" Measured reduction in mean normalized latency: %0.2f%% (positive is better).",
               100.0 * (1.0 - normalized_sum / baseline_normalized_sum));
    end else if (!HasComparableBaseline) begin
-     $display(" Original latency comparison omitted: array/arithmetic parameters differ from the saved reference.");
+     $display(" Original latency comparison omitted: array/arithmetic/A-port parameters differ from the saved reference.");
    end
    if (HasComparableC32Reference && (workload_failures == 0)) begin
      $display(" Previous C32/MReuse4 mean normalized latency: %.9f cycles/MAC (A/B/C=512/480/32).",

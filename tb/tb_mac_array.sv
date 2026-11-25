@@ -5,6 +5,9 @@
 
 module tb_mac_array;
 
+  timeunit 1ns;
+  timeprecision 1ps;
+
   //---------------------------
   // Design Time Parameters
   //---------------------------
@@ -12,6 +15,9 @@ module tb_mac_array;
   parameter int unsigned NumCores     = 16;
   parameter int unsigned NumInputs    = 32;
   parameter int unsigned OutDataWidth = 32;
+  // Run with NumContexts=1 for the original PE, and 4/8 for row reuse.
+  parameter int unsigned NumContexts  = 1;
+  localparam int unsigned ContextWidth = (NumContexts <= 1) ? 1 : $clog2(NumContexts);
 
   //---------------------------
   // Test Parameters
@@ -28,16 +34,20 @@ module tb_mac_array;
   logic a_valid_i, b_valid_i;
   logic init_save_i;
   logic acc_clr_i;
+  logic [ContextWidth-1:0] acc_context_i;
 
   logic signed [NumCores-1:0][OutDataWidth-1:0] c_o;
   logic signed [NumCores-1:0][OutDataWidth-1:0] golden_c_o;
+  logic signed [NumCores-1:0][OutDataWidth-1:0] context_golden [NumContexts];
+  logic signed [NumCores-1:0][OutDataWidth-1:0] held_result;
 
   // Instantiate the MAC Array module (16 cores x 32 inputs = 512 MACs)
   mac_array #(
     .InDataWidth  ( InDataWidth  ),
     .NumCores     ( NumCores     ),
     .NumInputs    ( NumInputs    ),
-    .OutDataWidth ( OutDataWidth )
+    .OutDataWidth ( OutDataWidth ),
+    .NumContexts  ( NumContexts  )
   ) i_dut (
     .clk_i        ( clk_i        ),
     .rst_ni       ( rst_ni       ),
@@ -47,6 +57,7 @@ module tb_mac_array;
     .b_valid_i    ( b_valid_i    ),
     .init_save_i  ( init_save_i  ),
     .acc_clr_i    ( acc_clr_i    ),
+    .acc_context_i( acc_context_i),
     .c_o          ( c_o          )
   );
 
@@ -67,6 +78,40 @@ module tb_mac_array;
     return acc;
   endfunction
 
+  // A distinct signed operand pattern per core, lane, row and K block catches
+  // accidental context aliasing. Consecutive calls accept one block per clock.
+  task automatic context_block(
+    input int unsigned context_id,
+    input bit first_block,
+    input int unsigned step_id
+  );
+    @(negedge clk_i);
+    acc_context_i = ContextWidth'(context_id);
+    acc_clr_i = 1'b0;
+    a_valid_i = 1'b1;
+    b_valid_i = 1'b1;
+    init_save_i = first_block;
+    for (int p = 0; p < NumCores; p++) begin
+      for (int j = 0; j < NumInputs; j++) begin
+        a_i[p][j] = InDataWidth'(((context_id+1)*13 + (p+1)*7 + j*3 + step_id*5) % 255 - 127);
+        b_i[p][j] = InDataWidth'(((context_id+1)*11 + (p+1)*3 + j*7 + step_id*9) % 255 - 127);
+      end
+      if (first_block)
+        context_golden[context_id][p] = dot_product_32(a_i[p], b_i[p]);
+      else
+        context_golden[context_id][p] = $signed(context_golden[context_id][p]) +
+                                         dot_product_32(a_i[p], b_i[p]);
+    end
+    @(posedge clk_i);
+    #1;
+    for (int p = 0; p < NumCores; p++) begin
+      if (c_o[p] !== context_golden[context_id][p])
+        $fatal(1, "Context %0d, step %0d, core %0d: got %0d, expected %0d",
+               context_id, step_id, p, $signed(c_o[p]),
+               $signed(context_golden[context_id][p]));
+    end
+  endtask
+
   //---------------------------
   // Start of testbench
   //---------------------------
@@ -79,12 +124,13 @@ module tb_mac_array;
 
   // Test control
   initial begin
-    clk_i       = 1'b0;
     rst_ni      = 1'b0;
     a_valid_i   = 1'b0;
     b_valid_i   = 1'b0;
     init_save_i = 1'b0;
     acc_clr_i   = 1'b0;
+    acc_context_i = '0;
+    for (int ctx = 0; ctx < NumContexts; ctx++) context_golden[ctx] = '0;
 
     for (int p = 0; p < NumCores; p++) begin
       golden_c_o[p] = '0;
@@ -168,8 +214,70 @@ module tb_mac_array;
                KSteps, NumInputs, t, NumCores);
     end
 
-    clk_delay(5);
-    $display("All MAC array tests passed!");
+    // Interleave rows, reversing their order on alternate K blocks. The output
+    // must follow the last COMPLETED block, not the current input row selector.
+    for (int step = 0; step < KSteps; step++) begin
+      for (int row = 0; row < NumContexts; row++) begin
+        context_block((step % 2 == 0) ? row : NumContexts-1-row,
+                      step == 0, step);
+      end
+    end
+
+    @(negedge clk_i);
+    held_result = c_o;
+    a_valid_i = 1'b0;
+    b_valid_i = 1'b0;
+    init_save_i = 1'b0;
+    acc_context_i = ContextWidth'((int'(acc_context_i)+1) % NumContexts);
+    #1;
+    if (c_o !== held_result)
+      $fatal(1, "Changing the input context changed the last completed result.");
+    clk_delay(1);
+    if (c_o !== held_result) $fatal(1, "Invalid block changed an accumulator.");
+
+    // Each mismatched valid combination must also hold all accumulated data.
+    for (int which = 0; which < 2; which++) begin
+      @(negedge clk_i);
+      a_valid_i = (which == 0);
+      b_valid_i = (which == 1);
+      clk_delay(1);
+      if (c_o !== held_result) $fatal(1, "Mismatched valid inputs changed a result.");
+    end
+
+    // Clear every context and prove it by accumulating without init_save.
+    @(negedge clk_i);
+    a_valid_i = 1'b0;
+    b_valid_i = 1'b0;
+    acc_clr_i = 1'b1;
+    clk_delay(1);
+    if (c_o !== '0) $fatal(1, "acc_clr_i did not clear the result.");
+    for (int ctx = 0; ctx < NumContexts; ctx++) context_golden[ctx] = '0;
+    for (int ctx = 0; ctx < NumContexts; ctx++) context_block(ctx, 1'b0, 51);
+
+    // Initializing one row must not destroy the remaining row contexts.
+    context_block(0, 1'b1, 97);
+    for (int ctx = 0; ctx < NumContexts; ctx++) context_block(ctx, 1'b0, 101);
+
+    // Asynchronous reset with live contexts, followed by fresh accumulation.
+    @(negedge clk_i);
+    a_valid_i = 1'b0;
+    b_valid_i = 1'b0;
+    init_save_i = 1'b0;
+    rst_ni = 1'b0;
+    #1;
+    if (c_o !== '0) $fatal(1, "Asynchronous reset did not clear the result.");
+    for (int ctx = 0; ctx < NumContexts; ctx++) context_golden[ctx] = '0;
+    clk_delay(2);
+    @(negedge clk_i);
+    rst_ni = 1'b1;
+    for (int ctx = 0; ctx < NumContexts; ctx++) context_block(ctx, 1'b0, 113);
+    @(negedge clk_i);
+    a_valid_i = 1'b0;
+    b_valid_i = 1'b0;
+    init_save_i = 1'b0;
+    clk_delay(2);
+    $display("GLOBAL PASS: MAC array arithmetic, %0d contexts, clear and reset passed.",
+             NumContexts);
     $finish;
   end
 

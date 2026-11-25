@@ -2,8 +2,8 @@
 // Controller unit test for the USER'S original interface, with the Idle fix:
 //   next_state = last_counter_last_value ? ControllerDrain : ControllerBusy;
 //
-// This testbench does NOT use the alternative input_ready/result_done interface.
-// Keep your current gemm_controller_mac_array.sv and ceiling_counter.sv.
+// MReuse=1 tests the original request order. Override MReuse=4 or 8 to test
+// row-interleaved GeMM, including partial M groups and output-valid bursts.
 //
 // What is checked:
 //   - every M/K/N index, using an independent linear request-number reference;
@@ -26,6 +26,7 @@ module tb_gemm_controller_mac_array;
   parameter int unsigned AddrWidth = 16;
   parameter int unsigned NumCores  = 16;
   parameter int unsigned NumInputs = 32;
+  parameter int unsigned MReuse    = 1;
 
   logic clk_i, rst_ni, start_i, input_valid_i;
   logic result_valid_o, mem_re_o, data_valid_o, init_save_o;
@@ -35,7 +36,8 @@ module tb_gemm_controller_mac_array;
   int unsigned passed_cases = 0;
 
   gemm_controller_mac_array #(
-    .AddrWidth(AddrWidth), .NumCores(NumCores), .NumInputs(NumInputs)
+    .AddrWidth(AddrWidth), .NumCores(NumCores), .NumInputs(NumInputs),
+    .MReuse(MReuse)
   ) i_dut (
     .clk_i(clk_i), .rst_ni(rst_ni), .start_i(start_i),
     .input_valid_i(input_valid_i),
@@ -90,16 +92,29 @@ module tb_gemm_controller_mac_array;
     input int unsigned request_index,
     input int unsigned k_blocks,
     input int unsigned n_steps,
+    input int unsigned m_size,
     input bit gemv,
     output int unsigned m_ref,
     output int unsigned k_ref,
     output int unsigned n_ref
   );
-    int unsigned tile_ref;
-    k_ref = (request_index % k_blocks) * NumInputs;
-    tile_ref = request_index / k_blocks;
-    m_ref = gemv ? tile_ref * NumCores : tile_ref / n_steps;
-    n_ref = gemv ? 0 : (tile_ref % n_steps) * NumCores;
+    int unsigned tile_ref, group_ref, group_request, rows_in_group;
+    if (gemv) begin
+      k_ref = (request_index % k_blocks) * NumInputs;
+      tile_ref = request_index / k_blocks;
+      m_ref = tile_ref * NumCores;
+      n_ref = 0;
+    end else begin
+      // Full groups have MReuse*n_steps*k_blocks requests. Only the final
+      // group can be short; its local row count changes the inner strides.
+      group_ref = request_index / (MReuse * n_steps * k_blocks);
+      group_request = request_index % (MReuse * n_steps * k_blocks);
+      rows_in_group = m_size - group_ref*MReuse;
+      if (rows_in_group > MReuse) rows_in_group = MReuse;
+      m_ref = group_ref*MReuse + (group_request % rows_in_group);
+      k_ref = ((group_request / rows_in_group) % k_blocks) * NumInputs;
+      n_ref = (group_request / (rows_in_group*k_blocks)) * NumCores;
+    end
   endtask
 
   //---------------------------
@@ -183,10 +198,12 @@ module tb_gemm_controller_mac_array;
       end
 
       // This expectation depends on our stimulus and reference, not DUT flags.
+      next_reference_index = (request_index == expected_steps) ? 0 : request_index;
+      reference_indices(next_reference_index, k_blocks, n_steps, m_sz, gemv,
+                        m_ref, k_ref, n_ref);
       expected_request = (request_index < expected_steps) && input_valid_i;
-      expected_first = expected_request && ((request_index % k_blocks) == 0);
-      expected_last_k = expected_request &&
-                        ((request_index % k_blocks) == (k_blocks - 1));
+      expected_first = expected_request && (k_ref == 0);
+      expected_last_k = expected_request && (k_ref == (k_blocks-1)*NumInputs);
       expected_final = expected_request && (request_index == expected_steps - 1);
 
       // Sample the request and current indices BEFORE the DUT's NBA updates.
@@ -195,9 +212,6 @@ module tb_gemm_controller_mac_array;
       check_bit(test_id, cycle, "mem_re_o", request_sample, expected_request);
       check_bit(test_id, cycle, "is_gemv_o", is_gemv_o, gemv);
 
-      next_reference_index = (request_index == expected_steps) ? 0 : request_index;
-      reference_indices(next_reference_index, k_blocks, n_steps, gemv,
-                        m_ref, k_ref, n_ref);
       check_index(test_id, cycle, "M_count_o before edge", M_count_o, m_ref);
       check_index(test_id, cycle, "K_count_o before edge", K_count_o, k_ref);
       check_index(test_id, cycle, "N_count_o before edge", N_count_o, n_ref);
@@ -218,7 +232,7 @@ module tb_gemm_controller_mac_array;
       // Also check the indices AFTER the edge. Stalls must preserve them.
       // After the final request the nested counters wrap back to zero.
       next_reference_index = (request_index == expected_steps) ? 0 : request_index;
-      reference_indices(next_reference_index, k_blocks, n_steps, gemv,
+      reference_indices(next_reference_index, k_blocks, n_steps, m_sz, gemv,
                         m_ref, k_ref, n_ref);
       check_index(test_id, cycle, "M_count_o after edge", M_count_o, m_ref);
       check_index(test_id, cycle, "K_count_o after edge", K_count_o, k_ref);
@@ -315,7 +329,15 @@ module tb_gemm_controller_mac_array;
     run_case(25, 3072, 1024,  1);
     run_case(26, 2816, 2048,  1);
 
-    $display("GLOBAL PASS: all %0d controller cases passed.", passed_cases);
+    // Reuse boundaries: incomplete final M group; a stall in a final-K row
+    // burst; and a pause on the row immediately before K advances.
+    run_case(27, MReuse+1,   2*NumInputs+1, NumCores+1,   0, 1,        3);
+    run_case(28, 2*MReuse+1, NumInputs,     NumCores,     0, MReuse,   2);
+    run_case(29, MReuse,     2*NumInputs,   NumCores,     0, MReuse-1, 3);
+    run_case(30, MReuse+3,   3*NumInputs,   2*NumCores+1, 3);
+
+    $display("GLOBAL PASS: all %0d controller cases passed (MReuse=%0d).",
+             passed_cases, MReuse);
     $finish;
   end
 endmodule

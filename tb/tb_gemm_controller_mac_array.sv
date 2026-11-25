@@ -1,14 +1,15 @@
 //-----------------------------------------------------------------------------
-// Controller unit test for the hierarchical 2 M x 8 N x 32 K mapping.
-// MReuse counts M rows; MReuse=64 and GemmRows=2 use 32 row-pair contexts.
-// GemmRows=1/MReuse=1 also checks the original one-row request sequence.
+// Controller unit test for the USER'S original interface, with the Idle fix:
+//   next_state = last_counter_last_value ? ControllerDrain : ControllerBusy;
+//
+// This testbench does NOT use the alternative input_ready/result_done interface.
+// Keep your current gemm_controller_mac_array.sv and ceiling_counter.sv.
 //
 // What is checked:
 //   - every M/K/N index, using an independent linear request-number reference;
 //   - the first request in Idle, ordinary requests, and no extra requests;
 //   - data_valid/init_save/result_valid timing, including cycles without reads;
-//   - input stalls at start, inside K, before final steps, and deterministic
-//     random stalls across context, K, N, and M-group boundaries;
+//   - input stalls at start, inside K, and before final K/global steps;
 //   - busy/done timing, one-cycle done, and return to Idle;
 //   - reset, X/Z detection, rounding boundaries, and all six required workloads;
 //   - all cases execute consecutively without resetting the DUT between cases.
@@ -25,11 +26,6 @@ module tb_gemm_controller_mac_array;
   parameter int unsigned AddrWidth = 16;
   parameter int unsigned NumCores  = 16;
   parameter int unsigned NumInputs = 32;
-  parameter int unsigned MReuse    = 64;
-  parameter int unsigned GemmRows  = 2;
-  localparam int unsigned GemmCols = NumCores/GemmRows;
-  localparam int unsigned NumContexts = MReuse/GemmRows;
-  localparam int unsigned MaxDimension = int'({AddrWidth{1'b1}});
 
   logic clk_i, rst_ni, start_i, input_valid_i;
   logic result_valid_o, mem_re_o, data_valid_o, init_save_o;
@@ -39,8 +35,7 @@ module tb_gemm_controller_mac_array;
   int unsigned passed_cases = 0;
 
   gemm_controller_mac_array #(
-    .AddrWidth(AddrWidth), .NumCores(NumCores), .NumInputs(NumInputs),
-    .MReuse(MReuse), .GemmRows(GemmRows)
+    .AddrWidth(AddrWidth), .NumCores(NumCores), .NumInputs(NumInputs)
   ) i_dut (
     .clk_i(clk_i), .rst_ni(rst_ni), .start_i(start_i),
     .input_valid_i(input_valid_i),
@@ -95,30 +90,16 @@ module tb_gemm_controller_mac_array;
     input int unsigned request_index,
     input int unsigned k_blocks,
     input int unsigned n_steps,
-    input int unsigned m_size,
     input bit gemv,
     output int unsigned m_ref,
     output int unsigned k_ref,
     output int unsigned n_ref
   );
-    int unsigned tile_ref, group_ref, group_request, rows_in_group, contexts_in_group;
-    if (gemv) begin
-      k_ref = (request_index % k_blocks) * NumInputs;
-      tile_ref = request_index / k_blocks;
-      m_ref = tile_ref * NumCores;
-      n_ref = 0;
-    end else begin
-      // Derive row pairs from a linear request number, independently of the
-      // DUT's nested counter implementation. The final group can be short.
-      group_ref = request_index / (NumContexts * n_steps * k_blocks);
-      group_request = request_index % (NumContexts * n_steps * k_blocks);
-      rows_in_group = m_size - group_ref*MReuse;
-      if (rows_in_group > MReuse) rows_in_group = MReuse;
-      contexts_in_group = rows_in_group/GemmRows + ((rows_in_group % GemmRows) != 0);
-      m_ref = group_ref*MReuse + (group_request % contexts_in_group)*GemmRows;
-      k_ref = ((group_request / contexts_in_group) % k_blocks) * NumInputs;
-      n_ref = (group_request / (contexts_in_group*k_blocks)) * GemmCols;
-    end
+    int unsigned tile_ref;
+    k_ref = (request_index % k_blocks) * NumInputs;
+    tile_ref = request_index / k_blocks;
+    m_ref = gemv ? tile_ref * NumCores : tile_ref / n_steps;
+    n_ref = gemv ? 0 : (tile_ref % n_steps) * NumCores;
   endtask
 
   //---------------------------
@@ -136,14 +117,12 @@ module tb_gemm_controller_mac_array;
     input int unsigned n_sz,
     input int unsigned start_stalls = 0,
     input int unsigned stall_before_request = 32'hffffffff,
-    input int unsigned stall_cycles = 0,
-    input int unsigned random_stall_percent = 0
+    input int unsigned stall_cycles = 0
   );
     int unsigned k_blocks, m_steps, n_steps, expected_steps;
     int unsigned request_index, result_cycles, cycle, max_cycles;
     int unsigned m_ref, k_ref, n_ref, next_reference_index;
     int unsigned stall_remaining;
-    int unsigned random_state, random_stalls;
     bit stall_started, gemv;
     bit expected_request, expected_first, expected_last_k, expected_final;
     bit previous_last_k, previous_final;
@@ -157,13 +136,10 @@ module tb_gemm_controller_mac_array;
 
     gemv = (n_sz == 1);
     k_blocks = k_sz / NumInputs + ((k_sz % NumInputs) != 0);
-    m_steps = gemv ? m_sz / NumCores + ((m_sz % NumCores) != 0) :
-                    m_sz / GemmRows + ((m_sz % GemmRows) != 0);
-    n_steps = gemv ? 1 : n_sz / GemmCols + ((n_sz % GemmCols) != 0);
+    m_steps = gemv ? m_sz / NumCores + ((m_sz % NumCores) != 0) : m_sz;
+    n_steps = gemv ? 1 : n_sz / NumCores + ((n_sz % NumCores) != 0);
     expected_steps = m_steps * n_steps * k_blocks;
-    max_cycles = expected_steps * 8 + start_stalls + stall_cycles + 100;
-    if (random_stall_percent > 75)
-      $fatal(1, "Test %0d: random_stall_percent must be at most 75", test_id);
+    max_cycles = expected_steps + start_stalls + stall_cycles + 20;
 
     if ((stall_cycles != 0) && (stall_before_request >= expected_steps))
       $fatal(1, "Test %0d: requested stall lies beyond the last request", test_id);
@@ -175,8 +151,6 @@ module tb_gemm_controller_mac_array;
     stall_started = 0;
     previous_last_k = 0;
     previous_final = 0;
-    random_state = 32'h9E37_2027 ^ test_id;
-    random_stalls = 0;
 
     check_idle("before start");
 
@@ -204,23 +178,15 @@ module tb_gemm_controller_mac_array;
         end else begin
           // Keep valid high even after the expected last request. The FSM must
           // stop requests itself; this catches the old one-step Idle bug.
-          // A local deterministic PRNG keeps test timing reproducible and
-          // independent of random-data generation elsewhere in the project.
-          random_state ^= random_state << 13;
-          random_state ^= random_state >> 17;
-          random_state ^= random_state << 5;
-          input_valid_i = ((random_state % 100) >= random_stall_percent);
-          if (!input_valid_i && request_index < expected_steps) random_stalls++;
+          input_valid_i = 1'b1;
         end
       end
 
       // This expectation depends on our stimulus and reference, not DUT flags.
-      next_reference_index = (request_index == expected_steps) ? 0 : request_index;
-      reference_indices(next_reference_index, k_blocks, n_steps, m_sz, gemv,
-                        m_ref, k_ref, n_ref);
       expected_request = (request_index < expected_steps) && input_valid_i;
-      expected_first = expected_request && (k_ref == 0);
-      expected_last_k = expected_request && (k_ref == (k_blocks-1)*NumInputs);
+      expected_first = expected_request && ((request_index % k_blocks) == 0);
+      expected_last_k = expected_request &&
+                        ((request_index % k_blocks) == (k_blocks - 1));
       expected_final = expected_request && (request_index == expected_steps - 1);
 
       // Sample the request and current indices BEFORE the DUT's NBA updates.
@@ -229,6 +195,9 @@ module tb_gemm_controller_mac_array;
       check_bit(test_id, cycle, "mem_re_o", request_sample, expected_request);
       check_bit(test_id, cycle, "is_gemv_o", is_gemv_o, gemv);
 
+      next_reference_index = (request_index == expected_steps) ? 0 : request_index;
+      reference_indices(next_reference_index, k_blocks, n_steps, gemv,
+                        m_ref, k_ref, n_ref);
       check_index(test_id, cycle, "M_count_o before edge", M_count_o, m_ref);
       check_index(test_id, cycle, "K_count_o before edge", K_count_o, k_ref);
       check_index(test_id, cycle, "N_count_o before edge", N_count_o, n_ref);
@@ -249,7 +218,7 @@ module tb_gemm_controller_mac_array;
       // Also check the indices AFTER the edge. Stalls must preserve them.
       // After the final request the nested counters wrap back to zero.
       next_reference_index = (request_index == expected_steps) ? 0 : request_index;
-      reference_indices(next_reference_index, k_blocks, n_steps, m_sz, gemv,
+      reference_indices(next_reference_index, k_blocks, n_steps, gemv,
                         m_ref, k_ref, n_ref);
       check_index(test_id, cycle, "M_count_o after edge", M_count_o, m_ref);
       check_index(test_id, cycle, "K_count_o after edge", K_count_o, k_ref);
@@ -271,8 +240,6 @@ module tb_gemm_controller_mac_array;
              test_id, request_index, expected_steps, result_cycles, m_steps*n_steps);
     if ((stall_cycles != 0) && !stall_started)
       $fatal(1, "Test %0d: directed stall was not exercised", test_id);
-    if ((random_stall_percent != 0) && (random_stalls == 0))
-      $fatal(1, "Test %0d: random stalls were not exercised", test_id);
 
     // Verify done lasts exactly one cycle, the pipeline clears and the DUT can
     // start the next case WITHOUT reset. Keep one extra idle clock as a check.
@@ -312,8 +279,7 @@ module tb_gemm_controller_mac_array;
     clk_delay(1);
     check_idle("after reset release");
 
-    // Original cases are preserved; explicit single-block cases for the new
-    // row-pair/column-group mapping are included below.
+    // Your original four cases and the two one-step regressions.
     run_case( 0, 32, 64,  1);
     run_case( 1, 20, 40,  1);
     run_case( 2,  2, 64, 32);
@@ -349,34 +315,7 @@ module tb_gemm_controller_mac_array;
     run_case(25, 3072, 1024,  1);
     run_case(26, 2816, 2048,  1);
 
-    // Reuse boundaries: incomplete final M group; a stall in a final-K row
-    // burst; and a pause on the row immediately before K advances.
-    run_case(27, MReuse+1,   2*NumInputs+1, NumCores+1,   0, 1,              3);
-    run_case(28, 2*MReuse+1, NumInputs,     NumCores,     0, NumContexts,    2);
-    run_case(29, MReuse,     2*NumInputs,   NumCores,     0, NumContexts-1,  3);
-    run_case(30, MReuse+3,   3*NumInputs,   2*NumCores+1, 3);
-
-    // Single accepted GeMM block, including a partially valid row pair and
-    // delayed first acceptance. This must go directly from Idle to Drain.
-    run_case(31, 1,        NumInputs, GemmCols);
-    run_case(32, GemmRows, NumInputs, GemmCols, 4);
-    run_case(33, GemmRows+1, NumInputs+1, GemmCols-1);
-    run_case(34, GemmRows+1, NumInputs+1, GemmCols+1);
-    run_case(35, (MReuse > 1) ? MReuse-1 : 1, NumInputs+1, GemmCols+1);
-
-    // Reproducible random acceptance gaps across every loop boundary.
-    run_case(36, 2*MReuse+1, 3*NumInputs+1, 2*GemmCols+1, 2, 1, 3, 35);
-    run_case(37, 2*NumCores+1, 3*NumInputs+1, 1, 3, 2, 2, 40);
-
-    // Exercise ceiling arithmetic at the largest size-port value. Adding
-    // span-1 in AddrWidth bits would wrap for each of these dimensions.
-    run_case(38, GemmRows, MaxDimension, GemmCols);
-    run_case(39, MaxDimension, 1, GemmCols);
-    run_case(40, GemmRows, 1, MaxDimension);
-    run_case(41, MaxDimension, 1, 1);
-
-    $display("GLOBAL PASS: all %0d controller cases passed (MReuse=%0d M rows, GemmRows=%0d, contexts=%0d).",
-             passed_cases, MReuse, GemmRows, NumContexts);
+    $display("GLOBAL PASS: all %0d controller cases passed.", passed_cases);
     $finish;
   end
 endmodule

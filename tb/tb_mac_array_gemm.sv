@@ -20,7 +20,7 @@ module tb_mac_array_gemm;
   parameter int unsigned OutputQueueDepth = 20;
   parameter int unsigned NumBanks = 8;
   parameter int unsigned BankDataWidth = 128;
-  parameter int unsigned VectorCacheElements = 2048;
+  parameter int unsigned GemvFragmentElements = 128;
   // Eight banks preserve exactly the old aggregate SRAM storage capacity:
   // 131072*104 +4096*8 +4096*16 =8*107264*16 bytes.
   parameter int unsigned DataDepth = 107264;
@@ -33,6 +33,7 @@ module tb_mac_array_gemm;
   localparam int unsigned BusBytes = NumBanks * BankBytes;
   localparam int unsigned GemmCols = NumCores / GemmRows;
   localparam int unsigned NumContexts = MReuse / GemmRows;
+  localparam int unsigned GemvReuseRows = NumContexts * NumCores;
   localparam int unsigned TileElements = NumCores * NumInputs;
   localparam int unsigned AReadWords = TileElements / BusBytes;
   localparam int unsigned BReadWords = (GemmCols*NumInputs) / (2*BankBytes);
@@ -42,10 +43,10 @@ module tb_mac_array_gemm;
   localparam int unsigned BElements = 8;
   localparam int unsigned GemmCElements = 2*BankResults;
   localparam int unsigned NumWorkloads = 6;
-  localparam int unsigned NumCases = 69;
+  localparam int unsigned NumCases = 75;
   localparam int unsigned PreviousCycles[NumWorkloads] =
     '{302, 558, 2350, 6971, 24686, 45166};
-  localparam real PreviousArea = 3152.0;
+  localparam real PreviousArea = 3068.09375;
 
   typedef struct {
     string name;
@@ -159,7 +160,8 @@ module tb_mac_array_gemm;
    '{"GeMV carry repeat", NumCores+1, 7*NumInputs-1, 1, 1},
    '{"GeMV carry changed", NumCores+1, 7*NumInputs-1, 1, 0},
 
-   // New bank/cache boundaries; all precede directed resets.
+   // Bank/fragment boundaries and the old 2048-byte-cache boundary.
+   // Large K now follows the same fragment schedule as every other GeMV.
    '{"GeMV cache K127", 33, 127, 1, 0},
    '{"GeMV cache K128", 33, 128, 1, 0},
    '{"GeMV cache K129", 33, 129, 1, 0},
@@ -167,7 +169,16 @@ module tb_mac_array_gemm;
    '{"GeMV cache changed", 33, 129, 1, 5},
    '{"GeMV cache limit", 17, 2048, 1, 0},
    '{"GeMV fallback", 17, 2049, 1, 0},
-   '{"GeMV fallback repeat", 17, 2049, 1, 6}
+   '{"GeMV fallback repeat", 17, 2049, 1, 6},
+
+   // GeMV uses the existing accumulator contexts for groups of 512 M rows.
+   // Cross the context-group and 128-byte fragment boundaries independently.
+   '{"GeMV ctx below", GemvReuseRows-1, GemvFragmentElements+1, 1, 0},
+   '{"GeMV ctx exact", GemvReuseRows, GemvFragmentElements+1, 1, 0},
+   '{"GeMV ctx above", GemvReuseRows+1, GemvFragmentElements+1, 1, 0},
+   '{"GeMV ctx cache", GemvReuseRows+1, GemvFragmentElements, 1, 0},
+   '{"GeMV ctx multi", 2*GemvReuseRows+1, NumInputs+1, 1, 0},
+   '{"GeMV ctx changed", GemvReuseRows+1, GemvFragmentElements+1, 1, 7}
  };
 
   int unsigned case_cycles[NumCases], case_errors[NumCases];
@@ -215,7 +226,7 @@ module tb_mac_array_gemm;
     ResetTopStart, ResetDuringLoad, ResetTopFlush, ResetTopIssue,
     ResetControllerDrain, ResetDuringCWrite, ResetPrefetchPending,
     ResetBPrefetchPending, ResetBankSwitch, ResetGemvWritePause,
-    ResetCacheLoad, ResetCacheResponse, ResetFallbackCache, ResetOutputBackpressure
+    ResetCacheLoad, ResetCacheResponse, ResetFragmentReload, ResetOutputBackpressure
   } reset_target_t;
   localparam int unsigned NumResetTargets = 6;
   localparam int unsigned NumResetCases = 2*NumResetTargets + 8;
@@ -287,7 +298,7 @@ module tb_mac_array_gemm;
     .AddrWidth(AddrWidth), .SizeAddrWidth(SizeAddrWidth),
     .NumCores(NumCores), .NumInputs(NumInputs), .GemmRows(GemmRows), .MReuse(MReuse),
     .OutputQueueDepth(OutputQueueDepth), .NumBanks(NumBanks),
-    .BankDataWidth(BankDataWidth), .VectorCacheElements(VectorCacheElements)
+    .BankDataWidth(BankDataWidth), .GemvFragmentElements(GemvFragmentElements)
   ) i_dut (
     .clk_i(clk_i), .rst_ni(rst_ni), .start_i(start),
     .M_size_i(M_i), .K_size_i(K_i), .N_size_i(N_i),
@@ -383,7 +394,9 @@ module tb_mac_array_gemm;
        (test_cases[test_id].name == "GeMV poison tails") ||
        (test_cases[test_id].name == "GeMV stream tails") ||
        (test_cases[test_id].name == "GeMV cache K129") ||
-       (test_cases[test_id].name == "GeMV fallback"));
+       (test_cases[test_id].name == "GeMV fallback") ||
+       (test_cases[test_id].name == "GeMV ctx above") ||
+       (test_cases[test_id].name == "GeMV ctx multi"));
     if (n_sz == 1) begin
       a_region_rows = ((m_sz+NumCores-1)/NumCores)*k_blocks*AReadWords;
       b_region_rows = (k_sz + BusBytes-1) / BusBytes;
@@ -520,8 +533,10 @@ module tb_mac_array_gemm;
   function automatic longint unsigned expected_b_reads(input int unsigned m_sz,k_sz,n_sz,reuse_rows);
     longint unsigned kb,mg,ng;
     if(n_sz==1) begin
-      if(k_sz<=VectorCacheElements) return (longint'(k_sz)+BankBytes-1)/BankBytes;
-      return ((longint'(m_sz)+NumCores-1)/NumCores)*((longint'(k_sz)+BankBytes-1)/BankBytes);
+      // One full logical vector per M supergroup; if it fits one fragment,
+      // keep that fragment across the supergroup boundary as well.
+      mg=(k_sz<=GemvFragmentElements)?1:(longint'(m_sz)+GemvReuseRows-1)/GemvReuseRows;
+      return mg*((longint'(k_sz)+BankBytes-1)/BankBytes);
     end
     kb=(longint'(k_sz)+NumInputs-1)/NumInputs;
     ng=(longint'(n_sz)+GemmCols-1)/GemmCols;
@@ -540,6 +555,26 @@ module tb_mac_array_gemm;
     active_pairs=((remaining<MReuse?remaining:MReuse)+GemmRows-1)/GemmRows;
     pair_index=within_group%active_pairs; k_block=(within_group/active_pairs)%kb;
     return (group*NumContexts+pair_index)*kb+k_block;
+  endfunction
+  function automatic longint unsigned expected_gemv_a_address(
+    input longint unsigned burst_index,input int unsigned m_sz,k_sz
+  );
+    longint unsigned kb,tile_index,supergroup,within_group,row_tiles,active_contexts;
+    longint unsigned context_index,k_block,physical_tile;
+    // Logical accepted order is [M supergroup][K block][16-row context].
+    // Decode the request ordinal independently of DUT counters and prefetches,
+    // then map it into the unchanged [M tile][K block] physical A layout.
+    kb=(longint'(k_sz)+NumInputs-1)/NumInputs;
+    row_tiles=(longint'(m_sz)+NumCores-1)/NumCores;
+    tile_index=burst_index/AReadWords;
+    supergroup=tile_index/(NumContexts*kb);
+    within_group=tile_index%(NumContexts*kb);
+    active_contexts=row_tiles-supergroup*NumContexts;
+    if(active_contexts>NumContexts) active_contexts=NumContexts;
+    context_index=within_group%active_contexts;
+    k_block=within_group/active_contexts;
+    physical_tile=(supergroup*NumContexts+context_index)*kb+k_block;
+    return physical_tile*AReadWords+burst_index%AReadWords;
   endfunction
   function automatic int unsigned timeout_cycles(input int unsigned m_sz,k_sz,n_sz);
     return 200+int'(expected_compute_steps(m_sz,k_sz,n_sz))*(BReadWords+NumCores+12)+k_sz;
@@ -666,7 +701,7 @@ module tb_mac_array_gemm;
               any_a=1;
               if(N_i==1) begin
                 expected_bank=int'(a_reads%NumBanks);
-                expected_addr=int'(a_reads/NumBanks);
+                expected_addr=int'(expected_gemv_a_address(a_reads/NumBanks,M_i,K_i));
               end else begin
                 expected_bank=int'(a_reads%4);
                 expected_addr=int'(expected_gemm_a_address(a_reads/4,M_i,K_i,N_i));
@@ -759,9 +794,9 @@ module tb_mac_array_gemm;
       ResetBPrefetchPending:return "GeMM B prefetch overlapping compute";
       ResetBankSwitch:return "GeMM B buffer switch";
       ResetGemvWritePause:return "GeMV C write stealing A read bandwidth";
-      ResetCacheLoad:return "B cache preload in progress";
-      ResetCacheResponse:return "final B cache response pending";
-      ResetFallbackCache:return "large-K fragment reload after compute";
+      ResetCacheLoad:return "initial B fragment request";
+      ResetCacheResponse:return "B fragment response pending";
+      ResetFragmentReload:return "prefetched B fragment response with MAC pending";
       ResetOutputBackpressure:return "output queue backpressure";
       default:return "unknown reset target";
     endcase
@@ -787,11 +822,11 @@ module tb_mac_array_gemm;
         (i_dut.b_compute_bank_q!=previous_b_bank);
       ResetGemvWritePause:return i_dut.is_gemv && i_dut.gemv_c_write && bank_re=='0 &&
         (i_dut.state_q!==i_dut.TopDrain);
-      ResetCacheLoad:return i_dut.is_gemv && i_dut.cache_request && i_dut.cache_beat_q!='0;
+      ResetCacheLoad:return i_dut.is_gemv && i_dut.cache_request && mac_compute_cycles==0;
       ResetCacheResponse:return i_dut.is_gemv && i_dut.cache_response_valid_q &&
         (i_dut.state_q===i_dut.TopCacheFlush);
-      ResetFallbackCache:return i_dut.cache_fallback && (i_dut.state_q===i_dut.TopCache) &&
-        mac_compute_cycles>0;
+      ResetFragmentReload:return i_dut.is_gemv && i_dut.cache_response_valid_q &&
+        i_dut.valid_data && mac_compute_cycles>0;
       ResetOutputBackpressure:return !i_dut.is_gemv && i_dut.output_stall;
       default:return 0;
     endcase
@@ -827,7 +862,7 @@ module tb_mac_array_gemm;
     if(target==ResetOutputBackpressure) begin am=MReuse;ak=NumInputs;an=4*GemmCols;end
     if(target==ResetGemvWritePause) am=4*NumCores+1;
     if(target==ResetCacheLoad || target==ResetCacheResponse) ak=257;
-    if(target==ResetFallbackCache) begin ak=VectorCacheElements+1;am=NumCores+1;end
+    if(target==ResetFragmentReload) begin ak=GemvFragmentElements+1;am=NumCores+1;end
     M_i=SizeAddrWidth'(am); K_i=SizeAddrWidth'(ak); N_i=SizeAddrWidth'(an);
     initialize_memories(0,am,ak,an,1'b1); maximum=timeout_cycles(am,ak,an);waited=0;
     $display("\n[RESET %0s] Abort job M=%0d K=%0d N=%0d.",label_text,am,ak,an);
@@ -873,7 +908,7 @@ module tb_mac_array_gemm;
     run_reset_case(ResetGemvWritePause,1);
     run_reset_case(ResetCacheLoad,1);
     run_reset_case(ResetCacheResponse,1);
-    run_reset_case(ResetFallbackCache,1);
+    run_reset_case(ResetFragmentReload,1);
     run_reset_case(ResetOutputBackpressure,0);
   endtask
 
@@ -1069,8 +1104,8 @@ module tb_mac_array_gemm;
     real ops,ref_norm,now_norm,ref_util,ref_sum,now_sum,ref_util_sum;
     real spatial_sum,temporal_sum,total_sum;
     ref_sum=0;now_sum=0;ref_util_sum=0;spatial_sum=0;temporal_sum=0;total_sum=0;
-    $display("\n COMPARISON -- banked Q25 versus current Q%0d",OutputQueueDepth);
-    $display(" Reference: 8x128-bit banks,2Mx8Nx32K,MReuse64,Q25,2048-byte GeMV B cache.");
+    $display("\n COMPARISON -- Q20 full B cache versus current Q%0d B fragments",OutputQueueDepth);
+    $display(" Reference: 8x128-bit banks,2Mx8Nx32K,MReuse64,Q20,2048-byte GeMV B cache.");
     $display(" %s | %10s | %10s | %16s | %16s",pad("Case",14),"Cycles ref","Cycles now","Cycles/MKN ref","Cycles/MKN now");
     for(int c=0;c<NumWorkloads;c++) begin
       ops=real'(test_cases[c].M)*real'(test_cases[c].K)*real'(test_cases[c].N);
@@ -1087,7 +1122,7 @@ module tb_mac_array_gemm;
     end
     $display(" %s | %10.2f%% | %10.2f%% | %10.2f%% | %10.2f%% | %10.2f%% | %10.2f%%",pad("Mean",14),100.0,spatial_sum/NumWorkloads,ref_util_sum/NumWorkloads,temporal_sum/NumWorkloads,ref_util_sum/NumWorkloads,total_sum/NumWorkloads);
     $display(" Mean normalized latency: reference=%.9f,current=%.9f cycles/MAC.",ref_sum/NumWorkloads,now_sum/NumWorkloads);
-    $display(" Measured reduction versus banked Q25: %0.2f%% (positive is better).",100.0*(1.0-now_sum/ref_sum));
+    $display(" Measured reduction versus Q20 full B cache: %0.2f%% (positive is better).",100.0*(1.0-now_sum/ref_sum));
   endtask
 
   task automatic print_report();
@@ -1120,7 +1155,7 @@ module tb_mac_array_gemm;
     for(int c=0;c<NumWorkloads;c++)
       $display(" %s | %10d | %10d | %10d | %12d | %10d | %10d",pad(test_cases[c].name,14),case_a_reads[c],case_b_reads[c],case_c_writes[c],case_write_cycles[c],case_output_stalls[c],case_queue_peak[c]);
     $display(" Logged area: %0.2f area units",metrics_pkg::area);
-    $display(" Banked Q25 area reference: %.5f; current: %.5f; change: %.2f%%.",PreviousArea,metrics_pkg::area,100.0*(metrics_pkg::area/PreviousArea-1.0));
+    $display(" Q20 full-cache area reference: %.5f; current: %.5f; change: %.2f%%.",PreviousArea,metrics_pkg::area,100.0*(metrics_pkg::area/PreviousArea-1.0));
     $display(" Queue observations: head wraps=%0d,tail wraps=%0d,full pop/reserve=%0d.",queue_head_wraps,queue_tail_wraps,queue_full_replacements);
     $display(" Bank observations: paired GeMV writes=%0d,GeMV write-pause cycles=%0d,read/write direction switches=%0d.",paired_c_writes,gemv_c_pause_events,bank_direction_switches);
     $display(" Bank timing observations: paired wrap=%0d,prefetch/C conflict=%0d,pending A response/C overlap=%0d.",paired_queue_wraps,prefetch_write_conflicts,response_write_overlap);
@@ -1136,8 +1171,8 @@ module tb_mac_array_gemm;
   initial begin : regression
     if(NumBanks!=8 || BankDataWidth!=128 || NumCores!=16 || NumInputs!=32 || GemmRows!=2)
       $fatal(1,"This banked regression uses8x128bit banks and a2Mx8Nx32K mapping.");
-    if(SizeAddrWidth<12 || VectorCacheElements<32 || VectorCacheElements>=4095)
-      $fatal(1,"Regression requires12-bit dimensions and a cache allowing the large-K fallback test.");
+    if(SizeAddrWidth<12 || GemvFragmentElements!=BusBytes || 2*GemvReuseRows+1>=4096)
+      $fatal(1,"Regression requires12-bit dimensions, one128-byte B fragment and representable context-tail tests.");
     start=0;rst_ni=0;M_i='0;K_i='0;N_i='0;monitor_active=0;case_finished=0;
     sram_tb_override=0;tb_bank_addr='0;tb_bank_re='0;tb_bank_we='0;tb_bank_wdata='0;
     sram_negative_active=0;sram_negative_cycles=0;
@@ -1152,9 +1187,9 @@ module tb_mac_array_gemm;
     repeat(5) @(negedge clk_i);rst_ni=1;clk_delay(1);
     $display("Random seed:0x%08h",RandomSeed);
     $display("Fixed physical memory: %0d banks x%0d bits,at most1024bits/cycle,one read OR write perbank.",NumBanks,BankDataWidth);
-    $display("Physical SRAM capacity: %0d bytes (%0d words perbank); unchanged aggregate capacity versus Q25.",NumBanks*DataDepth*BankBytes,DataDepth);
+    $display("Physical SRAM capacity: %0d bytes (%0d words perbank); unchanged aggregate capacity versus the Q20 full-cache reference.",NumBanks*DataDepth*BankBytes,DataDepth);
     $display("GeMM mapping=%0dMx%0dNx%0dK,MReuse=%0d,contexts=%0d,output queue=%0d.",GemmRows,GemmCols,NumInputs,MReuse,NumContexts,OutputQueueDepth);
-    $display("GeMV B cache=%0d int8 elements; larger K uses explicit fragment reloads.",VectorCacheElements);
+    $display("GeMV B fragment=%0d int8 elements in existing GeMM A slots; %0d M rows per context group.",GemvFragmentElements,GemvReuseRows);
     $display("PHASE 1: %0d matrix cases without an intermediate DUT reset.",NumCases);
     foreach(test_cases[c]) begin
       real ops,peak,compute_slots,total_slots;

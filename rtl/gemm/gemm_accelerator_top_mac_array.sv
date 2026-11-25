@@ -15,8 +15,12 @@
 // 128-byte bursts across all banks. Logical tail lanes remain present/masked.
 // A occupies rows0..Arows-1, Arows=ceil(M/16)*ceil(K/32)*4.
 // B starts at Arows; C starts at Arows+ceil(K/128). Both are striped in16-byte
-// words across all banks. B is cached once per job for K<=VectorCacheElements.
-// Larger K uses one32-byte B fragment per tile, preserving the size interface.
+// words across all banks. GeMV reuses the existing accumulator contexts:
+// [M group of NumContexts*16 rows][K block32][16-row context]. A128-byte B
+// fragment serves four K blocks across the whole M group. It occupies shared_q,
+// the existing GeMM A FIFO, which is otherwise unused in GeMV. No full-vector
+// cache or additional partial-sum storage is needed. If K<=128, that one B
+// fragment remains valid across successive M groups within the same job.
 // C pairs two16-result groups into one bank cycle; a final lone group drains.
 // C writes pause A/cache requests, but never discard pending SRAM responses.
 // Each accessed bank word is charged in full, including final word padding.
@@ -30,7 +34,7 @@ module gemm_accelerator_top_mac_array #(
   parameter int unsigned NumInputs      = 32,
   parameter int unsigned NumBanks       = 8,
   parameter int unsigned BankDataWidth  = 128,
-  parameter int unsigned VectorCacheElements = 2048,
+  parameter int unsigned GemvFragmentElements = 128,
   parameter int unsigned GemmRows       = 2,
   parameter int unsigned MReuse         = 64,
   parameter int unsigned OutputQueueDepth = 20
@@ -50,6 +54,7 @@ module gemm_accelerator_top_mac_array #(
 );
   localparam int unsigned GemmCols = NumCores / GemmRows;
   localparam int unsigned NumContexts = MReuse / GemmRows;
+  localparam int unsigned GemvReuseRows = NumContexts * NumCores;
   localparam int unsigned BankBytes = BankDataWidth/InDataWidth;
   localparam int unsigned BurstBytes = NumBanks*BankBytes;
   localparam int unsigned SramADataWidth = 4*BankDataWidth;
@@ -96,15 +101,15 @@ module gemm_accelerator_top_mac_array #(
   logic gemv_prefetch, gemm_release_bank, controller_done_seen_q, done_q;
   logic [BeatWidth-1:0] read_beat_q;
 
-  // Shared-port GeMV stream and local vector cache. Cache data may be stale
-  // between jobs, but cache_ready_q is cleared and every required byte reloaded.
-  logic [CalcWidth-1:0] gemv_a_word_q, gemv_b_base, gemv_c_base;
-  logic [CalcWidth-1:0] cache_beat_q, cache_response_beat_q;
+  // Shared-port GeMV stream. The B fragment lives in the existing shared_q
+  // payload; cache_ready_q is cleared for each job and on a fragment change.
+  logic [CalcWidth-1:0] gemv_b_base, gemv_c_base;
+  logic [CalcWidth-1:0] gemv_next_m, gemv_next_k, gemv_read_m, gemv_read_k;
+  logic [CalcWidth-1:0] gemv_fragment_base, gemv_cache_k;
   logic [NumBanks-1:0] cache_bank_mask, cache_response_mask_q;
-  logic [2:0] cache_first_bank, cache_response_first_bank_q;
-  logic cache_request, cache_response_valid_q, cache_last_request;
-  logic cache_fallback, cache_ready_q, gemv_a_request;
-  logic [VectorCacheElements*InDataWidth-1:0] vector_cache_q;
+  logic cache_request, cache_prefetch, cache_response_valid_q;
+  logic cache_ready_q, gemv_a_request, gemv_reload_b;
+  logic [2*SramADataWidth-1:0] gemv_b_fragment;
   logic [CountWidth-1:0] mac_k_q;
   logic [1:0] c_pop_count;
   logic gemv_c_write, gemv_pair_write;
@@ -163,6 +168,7 @@ module gemm_accelerator_top_mac_array #(
   logic [CalcWidth-1:0] c_row_offset, c_column_offset, c_access_address;
 
   logic [CalcWidth-1:0] k_blocks, c_words_per_row, m_group_base, row_in_group;
+  logic [CalcWidth-1:0] reuse_rows, rows_per_context;
   logic [CalcWidth-1:0] a_access_address, b_access_address, c_base_address;
   logic [CalcWidth-1:0] remaining_rows, remaining_cols, remaining_inputs, group_rows;
   logic [CoreCountWidth-1:0] active_cores, active_cols;
@@ -191,7 +197,7 @@ module gemm_accelerator_top_mac_array #(
   assign gemm_release_bank = !is_gemv && issue_block && last_reuse_row;
   assign gemm_a_pop = !is_gemv && issue_block;
   assign gemv_prefetch = is_gemv && (state_q == TopFlush) && issue_block &&
-                         !last_job_block && !cache_fallback && !gemv_c_write;
+                         !last_job_block && !gemv_reload_b && !gemv_c_write;
   assign done_o = done_q;
 
   gemm_controller_mac_array #(
@@ -213,10 +219,12 @@ module gemm_accelerator_top_mac_array #(
   always_comb begin
     k_blocks = (CalcWidth'(K_size_q) + CalcWidth'(NumInputs-1)) / CalcWidth'(NumInputs);
     c_words_per_row = (CalcWidth'(N_size_q) + CalcWidth'(CElements-1)) / CalcWidth'(CElements);
-    row_in_group = CalcWidth'(M_count) % CalcWidth'(MReuse);
+    reuse_rows = is_gemv ? CalcWidth'(GemvReuseRows) : CalcWidth'(MReuse);
+    rows_per_context = is_gemv ? CalcWidth'(NumCores) : CalcWidth'(GemmRows);
+    row_in_group = CalcWidth'(M_count) % reuse_rows;
     m_group_base = CalcWidth'(M_count) - row_in_group;
     group_rows = CalcWidth'(M_size_q) - m_group_base;
-    if (group_rows > CalcWidth'(MReuse)) group_rows = CalcWidth'(MReuse);
+    if (group_rows > reuse_rows) group_rows = reuse_rows;
     remaining_rows = CalcWidth'(M_size_q) - CalcWidth'(M_count);
     remaining_cols = CalcWidth'(N_size_q) - CalcWidth'(N_count);
     remaining_inputs = CalcWidth'(K_size_q) - CalcWidth'(K_count);
@@ -229,15 +237,29 @@ module gemm_accelerator_top_mac_array #(
       CoreCountWidth'(active_pair_rows) * active_cols;
     active_inputs = (remaining_inputs < CalcWidth'(NumInputs)) ?
                     InputCountWidth'(remaining_inputs) : InputCountWidth'(NumInputs);
-    row_context = is_gemv ? '0 : ContextWidth'(row_in_group / CalcWidth'(GemmRows));
+    row_context = ContextWidth'(row_in_group / rows_per_context);
     c_base_address = is_gemv ? CalcWidth'(M_count) :
                      CalcWidth'(M_count)*c_words_per_row + CalcWidth'(N_count)/CalcWidth'(CElements);
     last_k_block = (CalcWidth'(K_count)+CalcWidth'(NumInputs) >= CalcWidth'(K_size_q));
-    last_reuse_row = is_gemv || (row_in_group+CalcWidth'(GemmRows) >= group_rows);
+    last_reuse_row = (row_in_group+rows_per_context >= group_rows);
     last_job_block = last_k_block && (is_gemv ?
       (CalcWidth'(M_count)+CalcWidth'(NumCores) >= CalcWidth'(M_size_q)) :
       ((CalcWidth'(M_count)+CalcWidth'(GemmRows) >= CalcWidth'(M_size_q)) &&
        (CalcWidth'(N_count)+CalcWidth'(GemmCols) >= CalcWidth'(N_size_q))));
+
+    // The controller advances only on issue_block. Predict that same next
+    // GeMV context for the first A burst requested on the issue edge.
+    gemv_next_m = CalcWidth'(M_count) + CalcWidth'(NumCores);
+    gemv_next_k = CalcWidth'(K_count);
+    if (last_reuse_row) begin
+      if (last_k_block) begin
+        gemv_next_m = m_group_base + CalcWidth'(GemvReuseRows);
+        gemv_next_k = '0;
+      end else begin
+        gemv_next_m = m_group_base;
+        gemv_next_k = CalcWidth'(K_count) + CalcWidth'(NumInputs);
+      end
+    end
 
     a_fetch_group_base = (CalcWidth'(a_fetch_m_q)/CalcWidth'(MReuse))*CalcWidth'(MReuse);
     a_fetch_last_pair = (CalcWidth'(a_fetch_m_q)+CalcWidth'(GemmRows) >=
@@ -263,8 +285,21 @@ module gemm_accelerator_top_mac_array #(
                        k_blocks * CalcWidth'(AReadWords);
   assign gemv_c_base = gemv_b_base +
                       (CalcWidth'(K_size_q)+CalcWidth'(BurstBytes-1))/CalcWidth'(BurstBytes);
-  assign cache_fallback = (CalcWidth'(K_size_q) > CalcWidth'(VectorCacheElements));
-  assign cache_request = is_gemv && (state_q == TopCache) && !gemv_c_write;
+  assign gemv_cache_k = cache_prefetch ? gemv_next_k : CalcWidth'(K_count);
+  assign gemv_fragment_base = (gemv_cache_k/CalcWidth'(GemvFragmentElements)) *
+                              CalcWidth'(GemvFragmentElements);
+  assign gemv_reload_b = is_gemv && !last_job_block &&
+    ((gemv_next_k/CalcWidth'(GemvFragmentElements)) !=
+     (CalcWidth'(K_count)/CalcWidth'(GemvFragmentElements)));
+  assign gemv_read_m = gemv_prefetch ? gemv_next_m : CalcWidth'(M_count);
+  assign gemv_read_k = gemv_prefetch ? gemv_next_k : CalcWidth'(K_count);
+  // At a fragment boundary the issue edge can request the next B word.
+  // Its synchronous response updates shared_q one edge later, AFTER that
+  // edge's MAC has consumed the old fragment. A loading starts immediately.
+  assign cache_prefetch = is_gemv && (state_q == TopFlush) && issue_block &&
+                          gemv_reload_b && !gemv_c_write;
+  assign cache_request = is_gemv && !gemv_c_write &&
+                         ((state_q == TopCache) || cache_prefetch);
   assign gemv_a_request = is_gemv && !gemv_c_write &&
                          ((state_q == TopLoad) || gemv_prefetch);
   assign sram_a_re_o = is_gemv ? gemv_a_request : gemm_a_request;
@@ -272,40 +307,33 @@ module gemm_accelerator_top_mac_array #(
   assign sram_c_we_o = is_gemv ? gemv_c_write : c_valid_q;
 
   always_comb begin
-    a_access_address = is_gemv ? gemv_a_word_q :
+    a_access_address = is_gemv ?
+      ((gemv_read_m/CalcWidth'(NumCores))*k_blocks +
+       gemv_read_k/CalcWidth'(NumInputs))*CalcWidth'(AReadWords) +
+       (gemv_prefetch ? CalcWidth'(0) : CalcWidth'(read_beat_q)) :
       (CalcWidth'(a_fetch_m_q)/CalcWidth'(GemmRows))*k_blocks +
       CalcWidth'(a_fetch_k_q)/CalcWidth'(NumInputs);
     b_access_address = is_gemv ?
-      gemv_b_base + (cache_fallback ? CalcWidth'(K_count)/CalcWidth'(BurstBytes) : cache_beat_q) :
+      gemv_b_base + gemv_cache_k/CalcWidth'(BurstBytes) :
       ((CalcWidth'(b_fetch_n_q)/CalcWidth'(GemmCols))*k_blocks +
        CalcWidth'(b_fetch_k_q)/CalcWidth'(NumInputs))*CalcWidth'(BReadWords)+CalcWidth'(b_fetch_beat_q);
-    cache_first_bank = cache_fallback ? 3'((CalcWidth'(K_count)%CalcWidth'(BurstBytes))/CalcWidth'(BankBytes)) : '0;
     cache_bank_mask = '0;
     for (int bank=0; bank<NumBanks; bank++) begin
-      if (cache_fallback) begin
-        if ((bank >= int'(cache_first_bank)) &&
-            (bank < int'(cache_first_bank)+(int'(active_inputs)+BankBytes-1)/BankBytes))
-          cache_bank_mask[bank] = 1'b1;
-      end else if (cache_beat_q*CalcWidth'(BurstBytes)+CalcWidth'(bank*BankBytes) < CalcWidth'(K_size_q))
+      if (gemv_fragment_base+CalcWidth'(bank*BankBytes) < CalcWidth'(K_size_q))
         cache_bank_mask[bank] = 1'b1;
     end
-    cache_last_request = cache_fallback ||
-      ((cache_beat_q+CalcWidth'(1))*CalcWidth'(BurstBytes) >= CalcWidth'(K_size_q));
   end
 
-  // A cursor and cache request cursor advance only on granted accesses.
+  // Invalidate only when the next context needs another B fragment. Reusing
+  // K<=128 across M groups is safe; every new job still reloads its operands.
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      gemv_a_word_q <= '0; cache_beat_q <= '0; cache_ready_q <= 1'b0;
+      cache_ready_q <= 1'b0;
     end else if (accept_start) begin
-      gemv_a_word_q <= '0; cache_beat_q <= '0; cache_ready_q <= 1'b0;
+      cache_ready_q <= 1'b0;
     end else begin
-      if (gemv_a_request) gemv_a_word_q <= gemv_a_word_q + CalcWidth'(1);
-      if (cache_request) cache_beat_q <= cache_beat_q + CalcWidth'(1);
-      if (state_q == TopCacheFlush) cache_ready_q <= 1'b1;
-      if (is_gemv && issue_block && cache_fallback) begin
-        cache_beat_q <= '0; cache_ready_q <= 1'b0;
-      end
+      if (cache_response_valid_q) cache_ready_q <= 1'b1;
+      if (is_gemv && issue_block && gemv_reload_b) cache_ready_q <= 1'b0;
     end
   end
 
@@ -328,7 +356,7 @@ module gemm_accelerator_top_mac_array #(
           state_q <= TopStart;
         end
         TopStart: state_q <= is_gemv ? TopCache : TopLoad;
-        TopCache: if (cache_request && cache_last_request) state_q <= TopCacheFlush;
+        TopCache: if (cache_request) state_q <= TopCacheFlush;
         TopCacheFlush: begin read_beat_q <= '0; state_q <= TopLoad; end
         TopLoad: begin
           if (is_gemv) begin
@@ -342,8 +370,9 @@ module gemm_accelerator_top_mac_array #(
         TopFlush: if (issue_block) begin
           if (last_job_block) state_q <= TopDrain;
           else if (!is_gemv) state_q <= TopIssue;
-          else if (cache_fallback) begin
-            read_beat_q <= '0; state_q <= TopCache;
+          else if (gemv_reload_b) begin
+            read_beat_q <= '0;
+            state_q <= cache_prefetch ? TopLoad : TopCache;
           end else begin
             // C can steal the issue cycle's speculative first A request.
             read_beat_q <= gemv_prefetch ? BeatWidth'(1) : '0;
@@ -445,11 +474,9 @@ module gemm_accelerator_top_mac_array #(
       a_response_valid_q <= 1'b0; b_response_valid_q <= 1'b0;
       a_response_beat_q <= '0; b_response_beat_q <= '0;
       a_response_slot_q <= 1'b0; b_response_bank_q <= 1'b0;
-      cache_response_valid_q <= 1'b0; cache_response_beat_q <= '0;
-      cache_response_mask_q <= '0; cache_response_first_bank_q <= '0;
+      cache_response_valid_q <= 1'b0;
+      cache_response_mask_q <= '0;
       tile_q <= '0; shared_q <= '0;
-      for (int word=0; word<VectorCacheElements/BankBytes; word++)
-        vector_cache_q[word*BankDataWidth +: BankDataWidth] <= '0;
     end else begin
       a_response_valid_q <= sram_a_re_o;
       b_response_valid_q <= gemm_b_request;
@@ -463,9 +490,7 @@ module gemm_accelerator_top_mac_array #(
         b_response_bank_q <= b_fetch_bank_q;
       end
       if (cache_request) begin
-        cache_response_beat_q <= cache_beat_q;
         cache_response_mask_q <= cache_bank_mask;
-        cache_response_first_bank_q <= cache_first_bank;
       end
       if (a_response_valid_q) begin
         if (is_gemv)
@@ -478,15 +503,9 @@ module gemm_accelerator_top_mac_array #(
       if (cache_response_valid_q) begin
         for (int bank=0; bank<NumBanks; bank++) begin
           if (cache_response_mask_q[bank]) begin
-            for (int lane=0; lane<BankBytes; lane++) begin
-              if (cache_fallback) begin
-                if (bank >= int'(cache_response_first_bank_q))
-                  vector_cache_q[((bank-int'(cache_response_first_bank_q))*BankBytes+lane)*InDataWidth +: InDataWidth]
-                    <= bank_rdata_i[bank][lane*InDataWidth +: InDataWidth];
-              end else if (int'(cache_response_beat_q)*BurstBytes+bank*BankBytes+lane < VectorCacheElements)
-                vector_cache_q[(int'(cache_response_beat_q)*BurstBytes+bank*BankBytes+lane)*InDataWidth +: InDataWidth]
-                  <= bank_rdata_i[bank][lane*InDataWidth +: InDataWidth];
-            end
+            // GeMM owns these two A slots only in the other mode. The entire
+            // GeMV B fragment therefore costs no additional payload registers.
+            shared_q[bank/4][(bank%4)*BankDataWidth +: BankDataWidth] <= bank_rdata_i[bank];
           end
         end
       end
@@ -621,6 +640,7 @@ module gemm_accelerator_top_mac_array #(
   //---------------------------
   // Original arithmetic blocks: no extra multipliers or extra MAC array.
   //---------------------------
+  assign gemv_b_fragment = shared_q;
   always_comb begin
     array_a_in = '0; array_b_in = '0;
     for (int c=0; c<NumCores; c++) begin
@@ -629,7 +649,8 @@ module gemm_accelerator_top_mac_array #(
           if (is_gemv) begin
             if (c < int'(mac_core_count_q)) begin
               array_a_in[c][j] = $signed(tile_q[(c*NumInputs+j)*InDataWidth +: InDataWidth]);
-              array_b_in[c][j] = $signed(vector_cache_q[((cache_fallback ? 0 : int'(mac_k_q))+j)*InDataWidth +: InDataWidth]);
+              array_b_in[c][j] = $signed(gemv_b_fragment
+                [((int'(mac_k_q)%GemvFragmentElements)+j)*InDataWidth +: InDataWidth]);
             end
           end else if ((c/GemmCols < int'(mac_row_count_q)) &&
                        (c%GemmCols < int'(mac_col_count_q))) begin
@@ -661,8 +682,10 @@ module gemm_accelerator_top_mac_array #(
       $fatal(1, "Multiplier or aggregate bank-bandwidth budget exceeded.");
     if (MReuse == 0 || (MReuse % GemmRows) != 0 || OutputQueueDepth == 0)
       $fatal(1, "Invalid M reuse or output queue depth.");
-    if (VectorCacheElements < NumInputs || (VectorCacheElements % BurstBytes) != 0)
-      $fatal(1, "Vector cache must hold at least one fragment and whole128-byte bursts.");
+    if (GemvFragmentElements != BurstBytes ||
+        GemvFragmentElements*InDataWidth != 2*SramADataWidth ||
+        (GemvFragmentElements % NumInputs) != 0)
+      $fatal(1, "GeMV fragment must fit the existing128-byte shared payload and whole K blocks.");
   end
   always @(posedge clk_i) begin
     if (rst_ni) begin
@@ -701,8 +724,14 @@ module gemm_accelerator_top_mac_array #(
         $fatal(1, "GeMV prefetch must start at the next tile's first word.");
       if (is_gemv && issue_block && !cache_ready_q)
         $fatal(1, "GeMV issued before its B data were reloaded.");
+      if (is_gemv && issue_block && (int'(row_context) >= NumContexts))
+        $fatal(1, "GeMV row group exceeds the existing accumulator contexts.");
+      if (cache_response_valid_q && (!is_gemv || b_response_valid_q || gemm_a_request))
+        $fatal(1, "GeMV B fragment and GeMM payload ownership overlap.");
       if (gemv_a_request && gemv_c_write)
         $fatal(1, "GeMV A/C arbitration failed.");
+      if (cache_request && gemv_a_request)
+        $fatal(1, "GeMV A and B cannot own the same bank bus.");
       if (done_q && ((|bank_re_o) || (|bank_we_o) || valid_data || result_valid ||
                      output_queue_used_q != '0 || cache_response_valid_q))
         $fatal(1, "done asserted before all memory/MAC activity drained.");
@@ -715,8 +744,7 @@ module gemm_accelerator_top_mac_array #(
   // and accumulator contexts are accounted for by the unchanged PE modules.
   localparam int unsigned TopRegisterBits = $bits({
     state_q, M_size_q, K_size_q, N_size_q, read_beat_q, controller_done_seen_q, done_q,
-    gemv_a_word_q, cache_beat_q, cache_ready_q, vector_cache_q, mac_k_q,
-    cache_response_valid_q, cache_response_beat_q, cache_response_mask_q, cache_response_first_bank_q,
+    cache_ready_q, mac_k_q, cache_response_valid_q, cache_response_mask_q,
     b_valid_q, b_fetch_bank_q, b_compute_bank_q, b_fetch_done_q, b_fetch_beat_q,
     b_fetch_m_q, b_fetch_n_q, b_fetch_k_q,
     shared_q, a_ready_q, a_head_q, a_tail_q, a_used_q,
@@ -735,9 +763,6 @@ module gemm_accelerator_top_mac_array #(
   for (genvar g=0; g<(BufferBits+31)/32; g++) begin : gen_tile_energy
     localparam int unsigned Bits = ((BufferBits-32*g) >= 32) ? 32 : BufferBits-32*g;
     always @(tile_q[32*g +: Bits]) if (rst_ni) metrics_pkg::energy += real'(Bits)/32.0;
-  end
-  for (genvar g=0; g<(VectorCacheElements*InDataWidth)/32; g++) begin : gen_cache_energy
-    always @(vector_cache_q[32*g +: 32]) if (rst_ni) metrics_pkg::energy += 1.0;
   end
   for (genvar r=0; r<2; r++) begin : gen_shared_energy
     for (genvar g=0; g<(SramADataWidth+31)/32; g++) begin : gen_word
@@ -772,13 +797,9 @@ module gemm_accelerator_top_mac_array #(
   `CPAEP_TOP_REGISTER_ENERGY(K_size_q)
   `CPAEP_TOP_REGISTER_ENERGY(N_size_q)
   `CPAEP_TOP_REGISTER_ENERGY(read_beat_q)
-  `CPAEP_TOP_REGISTER_ENERGY(gemv_a_word_q)
-  `CPAEP_TOP_REGISTER_ENERGY(cache_beat_q)
   `CPAEP_TOP_REGISTER_ENERGY(cache_ready_q)
   `CPAEP_TOP_REGISTER_ENERGY(cache_response_valid_q)
-  `CPAEP_TOP_REGISTER_ENERGY(cache_response_beat_q)
   `CPAEP_TOP_REGISTER_ENERGY(cache_response_mask_q)
-  `CPAEP_TOP_REGISTER_ENERGY(cache_response_first_bank_q)
   `CPAEP_TOP_REGISTER_ENERGY(mac_k_q)
   `CPAEP_TOP_REGISTER_ENERGY(controller_done_seen_q)
   `CPAEP_TOP_REGISTER_ENERGY(done_q)

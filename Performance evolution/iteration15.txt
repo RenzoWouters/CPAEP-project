@@ -1,0 +1,164 @@
+# 
+# ===========================================================================================================================================
+#  RESULTS -- first six rows are the required workloads; remaining rows are extra tests
+# -------------------------------------------------------------------------------------------------------------------------------------------
+#  Case           |    M    K   N |   Cycles |   Cycles/MKN |  Spatial |  Temporal |    Total |       Energy |  SRAM energy | Check
+#  GeMM 1         |   64   64  32 |      302 |  0.002304077 |  100.00% |    84.77% |   84.77% |    830913.97 |       425984 | PASS
+#  GeMM 2         |   64  128  32 |      558 |  0.002128601 |  100.00% |    91.76% |   91.76% |    726448.44 |       720896 | PASS
+#  GeMM 3         |   64  576  32 |     2350 |  0.001992120 |  100.00% |    98.04% |   98.04% |   2834558.69 |      2785280 | PASS
+#  GeMV 1         | 1536  576   1 |     6981 |  0.007890489 |  100.00% |    24.75% |   24.75% |  14319833.88 |     14281728 | PASS
+#  GeMV 2         | 3072 1024   1 |    24726 |  0.007860184 |  100.00% |    24.85% |   24.85% |  50750878.50 |     50626560 | PASS
+#  GeMV 3         | 2816 2048   1 |    45246 |  0.007845445 |  100.00% |    24.90% |   24.90% |  92878844.75 |     92651520 | PASS
+#  GeMM tails     |    3   65  17 |       81 |  0.024434389 |   35.97% |    22.22% |    7.99% |     73600.03 |        59904 | PASS
+#  GeMV tails     |   17   33   1 |       24 |  0.042780749 |   27.39% |    16.67% |    4.57% |     39544.34 |        34816 | PASS
+#  Cache A first  |    1    1  32 |       39 |  1.218750000 |    1.56% |    10.26% |    0.16% |     22791.03 |        22528 | PASS
+#  Cache A repeat |    1    1  32 |       39 |  1.218750000 |    1.56% |    10.26% |    0.16% |     22684.91 |        22528 | PASS
+#  Single block   |    1    1   1 |       12 | 12.000000000 |    0.20% |     8.33% |    0.02% |      8801.28 |         8704 | PASS
+#  GeMM 2x18      |    2   33  18 |       56 |  0.047138047 |   38.67% |    10.71% |    4.14% |     40884.09 |        33792 | PASS
+#  GeMM 1x17      |    1   65  17 |       79 |  0.071493213 |   23.98% |    11.39% |    2.73% |     54593.16 |        47616 | PASS
+#  GeMV 1x65      |    1   65   1 |       20 |  0.307692308 |    4.23% |    15.00% |    0.63% |     26464.47 |        26112 | PASS
+#  GeMV 16x64     |   16   64   1 |       16 |  0.015625000 |  100.00% |    12.50% |   12.50% |     20185.72 |        18432 | PASS
+#  GeMM alt       |    4   34  18 |       58 |  0.023692810 |   39.84% |    20.69% |    8.24% |     54733.53 |        43008 | PASS
+#  GeMV alt       |    5   34   1 |       16 |  0.094117647 |   16.60% |    12.50% |    2.08% |     19303.94 |        17664 | PASS
+#  GeMM K31       |    2   31  16 |       24 |  0.024193548 |   96.88% |     8.33% |    8.07% |     12365.22 |        12288 | PASS
+#  GeMM K32       |    2   32  16 |       24 |  0.023437500 |  100.00% |     8.33% |    8.33% |     15548.66 |        12288 | PASS
+#  GeMM K60       |    2   60  16 |       40 |  0.020833333 |   93.75% |    10.00% |    9.38% |     26468.94 |        22528 | PASS
+#  GeMM K61       |    2   61  16 |       40 |  0.020491803 |   95.31% |    10.00% |    9.53% |     24760.00 |        22528 | PASS
+#  GeMM N16       |    2   64  16 |       40 |  0.019531250 |  100.00% |    10.00% |   10.00% |     25748.34 |        22528 | PASS
+#  GeMM N33       |    2   64  33 |       88 |  0.020833333 |   82.50% |    11.36% |    9.38% |     61255.31 |        56320 | PASS
+#  GeMV M15       |   15   64   1 |       16 |  0.016666667 |   93.75% |    12.50% |   11.72% |     20399.31 |        18432 | PASS
+#  GeMV M32       |   32   64   1 |       24 |  0.011718750 |  100.00% |    16.67% |   16.67% |     46392.50 |        35840 | PASS
+#  GeMV M33       |   33   64   1 |       33 |  0.015625000 |   68.75% |    18.18% |   12.50% |     55713.59 |        52480 | PASS
+#  GeMV K60       |   16   60   1 |       16 |  0.016666667 |   93.75% |    12.50% |   11.72% |     20629.62 |        18432 | PASS
+#  GeMV max SRAM  | 4095 2048   1 |    65798 |  0.007845648 |   99.98% |    24.90% |   24.89% | 135083777.16 |    134742016 | PASS
+#  GeMM 1 random  |   64   64  32 |      302 |  0.002304077 |  100.00% |    84.77% |   84.77% |    831683.41 |       425984 | PASS
+#  GeMM 2 random  |   64  128  32 |      558 |  0.002128601 |  100.00% |    91.76% |   91.76% |   1527877.44 |       720896 | PASS
+#  GeMM 3 random  |   64  576  32 |     2350 |  0.001992120 |  100.00% |    98.04% |   98.04% |   6402712.69 |      2785280 | PASS
+#  GeMV 1 random  | 1536  576   1 |     6981 |  0.007890489 |  100.00% |    24.75% |   24.75% |  17265166.62 |     14281728 | PASS
+#  GeMV 2 random  | 3072 1024   1 |    24726 |  0.007860184 |  100.00% |    24.85% |   24.85% |  61234029.50 |     50626560 | PASS
+#  GeMV 3 random  | 2816 2048   1 |    45246 |  0.007845445 |  100.00% |    24.90% |   24.90% | 112146047.75 |     92651520 | PASS
+#  GeMM N15       |    2   64  15 |       40 |  0.020833333 |   93.75% |    10.00% |    9.38% |     30434.06 |        22528 | PASS
+#  GeMV K32       |   16   32   1 |       12 |  0.023437500 |  100.00% |     8.33% |    8.33% |     14037.28 |         9728 | PASS
+#  GeMV K61       |   16   61   1 |       16 |  0.016393443 |   95.31% |    12.50% |   11.91% |     24482.50 |        18432 | PASS
+#  Reuse below    |   63   33  17 |      237 |  0.006705713 |   35.95% |    81.01% |   29.13% |    435149.31 |       317952 | PASS
+#  Reuse exact    |   64   32  32 |      270 |  0.004119873 |  100.00% |    47.41% |   47.41% |    620024.16 |       278528 | PASS
+#  Reuse above    |   65   64  16 |      176 |  0.002644231 |   98.48% |    75.00% |   73.86% |    442099.59 |       234496 | PASS
+#  Reuse multi tails |  129   65  33 |     1087 |  0.003928371 |   55.43% |    89.70% |   49.72% |   2398583.38 |      1512960 | PASS
+#  GeMV consecutive |   33   32   1 |       21 |  0.019886364 |   68.75% |    14.29% |    9.82% |     33562.44 |        27392 | PASS
+#  GeMM pair below |    1   31   7 |       15 |  0.069124424 |   42.38% |     6.67% |    2.83% |      6472.22 |         5632 | PASS
+#  GeMM pair exact |    2   32   8 |       16 |  0.031250000 |  100.00% |     6.25% |    6.25% |      8374.19 |         6144 | PASS
+#  GeMM pair above |    3   33   9 |       41 |  0.046015713 |   21.75% |    19.51% |    4.24% |     34672.44 |        27648 | PASS
+#  GeMM C below   |    3   31   3 |       17 |  0.060931900 |   27.25% |    11.76% |    3.21% |      8891.69 |         7680 | PASS
+#  GeMM C exact   |    3   32   4 |       17 |  0.044270833 |   37.50% |    11.76% |    4.41% |      9790.28 |         7680 | PASS
+#  GeMM C above   |    3   33   5 |       25 |  0.050505051 |   24.17% |    16.00% |    3.87% |     17599.38 |        13824 | PASS
+#  GeMV B below   |   17    7   1 |       16 |  0.134453782 |   11.62% |    12.50% |    1.45% |     19022.03 |        17920 | PASS
+#  GeMV B exact   |   17    8   1 |       16 |  0.117647059 |   13.28% |    12.50% |    1.66% |     19109.62 |        17920 | PASS
+#  GeMV B above   |   17    9   1 |       16 |  0.104575163 |   14.94% |    12.50% |    1.87% |     19279.62 |        17920 | PASS
+#  GeMM poison tails |    3   33   9 |       41 |  0.046015713 |   21.75% |    19.51% |    4.24% |     33441.69 |        27648 | PASS
+#  GeMV poison tails |   17   33   1 |       24 |  0.042780749 |   27.39% |    16.67% |    4.57% |     39666.62 |        34816 | PASS
+#  GeMV stream 12 |   16  384   1 |       58 |  0.009440104 |  100.00% |    20.69% |   20.69% |    141452.69 |       105472 | PASS
+#  GeMV stream 13 |   16  416   1 |       63 |  0.009465144 |  100.00% |    20.63% |   20.63% |    155580.22 |       114176 | PASS
+#  GeMV stream 14 |   16  448   1 |       67 |  0.009347098 |  100.00% |    20.90% |   20.90% |    165943.34 |       122880 | PASS
+#  GeMV stream M  |  224   32   1 |       70 |  0.009765625 |  100.00% |    20.00% |   20.00% |    154643.28 |       129536 | PASS
+#  GeMV stream tails |   33  159   1 |       70 |  0.013340957 |   68.32% |    21.43% |   14.64% |    160014.56 |       127744 | PASS
+#  GeMV carry first |   17  223   1 |       65 |  0.017145872 |   52.89% |    21.54% |   11.39% |    150999.03 |       119552 | PASS
+#  GeMV carry repeat |   17  223   1 |       65 |  0.017145872 |   52.89% |    21.54% |   11.39% |    119870.28 |       119552 | PASS
+#  GeMV carry changed |   17  223   1 |       65 |  0.017145872 |   52.89% |    21.54% |   11.39% |    150989.81 |       119552 | PASS
+#  GeMV cache K127 |   33  127   1 |       57 |  0.013600573 |   68.21% |    21.05% |   14.36% |    127397.75 |       102656 | PASS
+#  GeMV cache K128 |   33  128   1 |       57 |  0.013494318 |   68.75% |    21.05% |   14.47% |    127534.94 |       102656 | PASS
+#  GeMV cache K129 |   33  129   1 |       70 |  0.016443505 |   55.43% |    21.43% |   11.88% |    152894.56 |       127488 | PASS
+#  GeMV cache first |   33  129   1 |       70 |  0.016443505 |   55.43% |    21.43% |   11.88% |    152693.62 |       127488 | PASS
+#  GeMV cache changed |   33  129   1 |       70 |  0.016443505 |   55.43% |    21.43% |   11.88% |    144992.78 |       127488 | PASS
+#  GeMV cache limit |   17 2048   1 |      535 |  0.015366498 |   53.12% |    23.93% |   12.71% |   1372265.06 |      1082624 | PASS
+#  GeMV fallback  |   17 2049   1 |      544 |  0.015617374 |   52.33% |    23.90% |   12.51% |   1389708.28 |      1099264 | PASS
+#  GeMV fallback repeat |   17 2049   1 |      544 |  0.015617374 |   52.33% |    23.90% |   12.51% |   1368723.34 |      1099264 | PASS
+#  GeMV ctx below |  511  129   1 |      664 |  0.010072968 |   80.47% |    24.10% |   19.39% |   1570446.56 |      1345792 | PASS
+#  GeMV ctx exact |  512  129   1 |      664 |  0.010053295 |   80.62% |    24.10% |   19.43% |   1570568.47 |      1345792 | PASS
+#  GeMV ctx above |  513  129   1 |      687 |  0.010381250 |   78.33% |    24.02% |   18.81% |   1615134.38 |      1389312 | PASS
+#  GeMV ctx cache |  513  128   1 |      552 |  0.008406433 |   97.16% |    23.91% |   23.23% |   1339167.97 |      1116416 | PASS
+#  GeMV ctx multi | 1025   33   1 |      560 |  0.016555802 |   50.82% |    23.21% |   11.80% |   1251951.41 |      1131520 | PASS
+#  GeMV ctx changed |  513  129   1 |      687 |  0.010381250 |   78.33% |    24.02% |   18.81% |   1396172.97 |      1389312 | PASS
+# -------------------------------------------------------------------------------------------------------------------------------------------
+#  Mean normalized latency (ONLY six required workloads): 0.005003486 cycles/MAC
+#  Mean spatial utilization  (ONLY six required workloads): 100.00%
+#  Mean temporal utilization (ONLY six required workloads): 58.18%
+#  Mean total utilization    (ONLY six required workloads): 58.18%
+# 
+#  COMPARISON -- Q20 full B cache versus current Q20 B fragments
+#  Reference: 8x128-bit banks,2Mx8Nx32K,MReuse64,Q20,2048-byte GeMV B cache.
+#  Case           | Cycles ref | Cycles now |   Cycles/MKN ref |   Cycles/MKN now
+#  GeMM 1         |        302 |        302 |      0.002304077 |      0.002304077
+#  GeMM 2         |        558 |        558 |      0.002128601 |      0.002128601
+#  GeMM 3         |       2350 |       2350 |      0.001992120 |      0.001992120
+#  GeMV 1         |       6971 |       6981 |      0.007879187 |      0.007890489
+#  GeMV 2         |      24686 |      24726 |      0.007847468 |      0.007860184
+#  GeMV 3         |      45166 |      45246 |      0.007831573 |      0.007845445
+#  Case           | Spatial ref | Spatial now |   Temp. ref |   Temp. now |   Total ref |   Total now
+#  GeMM 1         |     100.00% |     100.00% |      84.77% |      84.77% |      84.77% |      84.77%
+#  GeMM 2         |     100.00% |     100.00% |      91.76% |      91.76% |      91.76% |      91.76%
+#  GeMM 3         |     100.00% |     100.00% |      98.04% |      98.04% |      98.04% |      98.04%
+#  GeMV 1         |     100.00% |     100.00% |      24.79% |      24.75% |      24.79% |      24.75%
+#  GeMV 2         |     100.00% |     100.00% |      24.89% |      24.85% |      24.89% |      24.85%
+#  GeMV 3         |     100.00% |     100.00% |      24.94% |      24.90% |      24.94% |      24.90%
+#  Mean           |     100.00% |     100.00% |      58.20% |      58.18% |      58.20% |      58.18%
+#  Mean normalized latency: reference=0.004997171,current=0.005003486 cycles/MAC.
+#  Measured reduction versus Q20 full B cache: -0.13% (positive is better).
+# 
+#  PHYSICAL BANK TRAFFIC -- each counted access transfers one full128-bit word
+#  Case           |    A reads |    B reads |   C writes | C bus cycles |   C stalls | Queue peak
+#  GeMM 1         |       1024 |        128 |        512 |          256 |          0 |         18
+#  GeMM 2         |       2048 |        256 |        512 |          256 |          0 |         18
+#  GeMM 3         |       9216 |       1152 |        512 |          256 |          0 |         18
+#  GeMV 1         |      55296 |        108 |        384 |           48 |          0 |          2
+#  GeMV 2         |     196608 |        384 |        768 |           96 |          0 |          2
+#  GeMV 3         |     360448 |        768 |        704 |           88 |          0 |          2
+#  Logged area: 2553.38 area units
+#  Q20 full-cache area reference: 3068.09375; current: 2553.37500; change: -16.78%.
+#  Queue observations: head wraps=146,tail wraps=146,full pop/reserve=92.
+#  Bank observations: paired GeMV writes=731,GeMV write-pause cycles=754,read/write direction switches=11344.
+#  Bank timing observations: paired wrap=9,prefetch/C conflict=0,pending A response/C overlap=709.
+#  Energy/area totals depend on the metric hooks implemented in the RTL modules.
+# ===========================================================================================================================================
+# 
+# All 75 matrix cases passed!
+# Reset/restart tests:20/20 PASS.
+# 
+# ==========================================
+#  PHASE 3: BANKED SRAM COVERAGE EXERCISE
+# ==========================================
+# [SRAM NEGATIVE BEGIN] expected_errors=8 address=0
+# ** Error: tb_mac_array_gemm.gen_sram_banks[0].i_sram: mem_re_i and mem_we_i are both high at address 0
+#    Time: 2380655 ns  Scope: tb_mac_array_gemm.gen_sram_banks[0].i_sram File: rtl/common/single_port_memory.sv Line: 70
+# ** Error: tb_mac_array_gemm.gen_sram_banks[1].i_sram: mem_re_i and mem_we_i are both high at address 0
+#    Time: 2380655 ns  Scope: tb_mac_array_gemm.gen_sram_banks[1].i_sram File: rtl/common/single_port_memory.sv Line: 70
+# ** Error: tb_mac_array_gemm.gen_sram_banks[2].i_sram: mem_re_i and mem_we_i are both high at address 0
+#    Time: 2380655 ns  Scope: tb_mac_array_gemm.gen_sram_banks[2].i_sram File: rtl/common/single_port_memory.sv Line: 70
+# ** Error: tb_mac_array_gemm.gen_sram_banks[3].i_sram: mem_re_i and mem_we_i are both high at address 0
+#    Time: 2380655 ns  Scope: tb_mac_array_gemm.gen_sram_banks[3].i_sram File: rtl/common/single_port_memory.sv Line: 70
+# ** Error: tb_mac_array_gemm.gen_sram_banks[4].i_sram: mem_re_i and mem_we_i are both high at address 0
+#    Time: 2380655 ns  Scope: tb_mac_array_gemm.gen_sram_banks[4].i_sram File: rtl/common/single_port_memory.sv Line: 70
+# ** Error: tb_mac_array_gemm.gen_sram_banks[5].i_sram: mem_re_i and mem_we_i are both high at address 0
+#    Time: 2380655 ns  Scope: tb_mac_array_gemm.gen_sram_banks[5].i_sram File: rtl/common/single_port_memory.sv Line: 70
+# ** Error: tb_mac_array_gemm.gen_sram_banks[6].i_sram: mem_re_i and mem_we_i are both high at address 0
+#    Time: 2380655 ns  Scope: tb_mac_array_gemm.gen_sram_banks[6].i_sram File: rtl/common/single_port_memory.sv Line: 70
+# ** Error: tb_mac_array_gemm.gen_sram_banks[7].i_sram: mem_re_i and mem_we_i are both high at address 0
+#    Time: 2380655 ns  Scope: tb_mac_array_gemm.gen_sram_banks[7].i_sram File: rtl/common/single_port_memory.sv Line: 70
+# [SRAM NEGATIVE END] cycles=1
+# [SRAM COV] PASS: all 8 banks passed read/write, latency, hold and reset checks.
+# [SRAM NEGATIVE] Stimulus completed; expected-error log check required.
+# 
+# ==========================================
+#  FUNCTIONAL COVERAGE
+# ==========================================
+# Covergroup total: 100.00%
+# Mode coverage:    100.00%
+# K coverage:       100.00%
+# M coverage:       100.00%
+# N coverage:       100.00%
+# Pattern coverage: 100.00%
+# Mode x K cross:   100.00%
+# ==========================================
+# All 75 matrix cases and 20 reset/restart tests passed!
+# [REGRESSION COMPLETE] matrix_cases=75 reset_tests=20 sram_positive=PASS negative_stimulus=COMPLETE
+# ** Note: $finish    : tb/tb_mac_array_gemm.sv(1239)
+#    Time: 2380726 ns  Iteration: 0  Instance: /tb_mac_array_gemm

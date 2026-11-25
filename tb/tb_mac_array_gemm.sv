@@ -5,6 +5,7 @@
 // Same structure as tb_one_mac_gemm: SRAMs, case table, golden model, report.
 
 // Expanded boundary, data-pattern and functional-coverage regression.
+// Additional random-data runs cover all six required workload dimensions.
 // One reset at startup; all cases then run consecutively without a DUT reset.
 
 //-----------------------------------------------------------------------------
@@ -71,57 +72,70 @@ module tb_mac_array_gemm;
 
    int unsigned N;
 
+   int unsigned pattern;
+
  } test_case_t;
 
  // Only the first six cases contribute to the project latency score.
 
  localparam int unsigned NumWorkloads = 6;
 
- localparam int unsigned NumCases     = 28;
+ localparam int unsigned NumCases     = 34;
 
+ // Pattern IDs: 0=random, 1=zero, 2=+1, 3=-1, 4=A:-1/B:+1,
+ //              5=+127, 6=-128, 7=alternating A / B:+1.
  test_case_t test_cases [NumCases] = '{
-   // name              M     K     N
-   '{"GeMM 1",           64,   64, 32},
-   '{"GeMM 2",           64,  128, 32},
-   '{"GeMM 3",           64,  576, 32},
-   '{"GeMV 1",         1536,  576,  1},
-   '{"GeMV 2",         3072, 1024,  1},
-   '{"GeMV 3",         2816, 2048,  1},
+   // name              M     K     N  pattern
+   '{"GeMM 1",           64,   64, 32, 0},
+   '{"GeMM 2",           64,  128, 32, 1},
+   '{"GeMM 3",           64,  576, 32, 2},
+   '{"GeMV 1",         1536,  576,  1, 3},
+   '{"GeMV 2",         3072, 1024,  1, 4},
+   '{"GeMV 3",         2816, 2048,  1, 5},
 
    // Existing integration tests
-   '{"GeMM tails",        3,   65, 17},
-   '{"GeMV tails",       17,   33,  1},
-   '{"Cache A first",     1,    1, 32},
-   '{"Cache A repeat",    1,    1, 32},
-   '{"Single block",      1,    1,  1},
-   '{"GeMM 2x18",         2,   33, 18},
-   '{"GeMM 1x17",         1,   65, 17},
-   '{"GeMV 1x65",         1,   65,  1},
-   '{"GeMV 16x64",       16,   64,  1},
-   '{"GeMM alt",          4,   34, 18},
-   '{"GeMV alt",          5,   34,  1},
+   '{"GeMM tails",        3,   65, 17, 6},
+   '{"GeMV tails",       17,   33,  1, 7},
+   '{"Cache A first",     1,    1, 32, 0},
+   '{"Cache A repeat",    1,    1, 32, 1},
+   '{"Single block",      1,    1,  1, 2},
+   '{"GeMM 2x18",         2,   33, 18, 3},
+   '{"GeMM 1x17",         1,   65, 17, 4},
+   '{"GeMV 1x65",         1,   65,  1, 5},
+   '{"GeMV 16x64",       16,   64,  1, 6},
+   '{"GeMM alt",          4,   34, 18, 7},
+   '{"GeMV alt",          5,   34,  1, 0},
 
    // K boundary tests
-   '{"GeMM K31",          2,   31, 16},
-   '{"GeMM K32",          2,   32, 16},
-   '{"GeMM K60",          2,   60, 16},
-   '{"GeMM K61",          2,   61, 16},
+   '{"GeMM K31",          2,   31, 16, 1},
+   '{"GeMM K32",          2,   32, 16, 2},
+   '{"GeMM K60",          2,   60, 16, 3},
+   '{"GeMM K61",          2,   61, 16, 4},
 
    // N boundary tests
-   '{"GeMM N16",          2,   64, 16},
-   '{"GeMM N33",          2,   64, 33},
+   '{"GeMM N16",          2,   64, 16, 5},
+   '{"GeMM N33",          2,   64, 33, 6},
 
    // M boundary tests
-   '{"GeMV M15",         15,   64,  1},
-   '{"GeMV M32",         32,   64,  1},
-   '{"GeMV M33",         33,   64,  1},
+   '{"GeMV M15",         15,   64,  1, 7},
+   '{"GeMV M32",         32,   64,  1, 0},
+   '{"GeMV M33",         33,   64,  1, 1},
 
    // GeMV B-vector packing boundary
-   '{"GeMV K60",         16,   60,  1},
+   '{"GeMV K60",         16,   60,  1, 2},
 
    // Maximum A SRAM usage while respecting 12-bit size inputs.
    // M=4095 is the largest representable dimension (M=4096 would wrap to zero).
-   '{"GeMV max SRAM",  4095, 2048,  1}
+   '{"GeMV max SRAM",  4095, 2048,  1, 3},
+
+   // All six required workloads again, each with fresh random A and B data.
+   // These are correctness regressions; only the first six rows are scored.
+   '{"GeMM 1 random",    64,   64, 32, 0},
+   '{"GeMM 2 random",    64,  128, 32, 0},
+   '{"GeMM 3 random",    64,  576, 32, 0},
+   '{"GeMV 1 random",  1536,  576,  1, 0},
+   '{"GeMV 2 random",  3072, 1024,  1, 0},
+   '{"GeMV 3 random",  2816, 2048,  1, 0}
  };
 
  int unsigned     case_cycles [NumCases];
@@ -346,6 +360,20 @@ module tb_mac_array_gemm;
 
  // one common DataDepth. Their adapted equivalents are local to this TB.
 
+ function automatic string pattern_name(input int unsigned pattern);
+   case (pattern)
+     0: return "random int8 + explicit extremes";
+     1: return "all zero";
+     2: return "all +1";
+     3: return "all -1";
+     4: return "A=-1, B=+1";
+     5: return "all +127";
+     6: return "all -128";
+     7: return "alternating A, B=+1";
+     default: return "unknown";
+   endcase
+ endfunction
+
  task automatic initialize_memories(
 
    input int unsigned test_id,
@@ -423,8 +451,8 @@ module tb_mac_array_gemm;
    mac_compute_cycles = 0;
 
 
-   // Cycle through eight directed/random signed-int8 data patterns.
-   active_pattern = test_id % 8;
+   // The case table selects the pattern explicitly, independent of its index.
+   active_pattern = test_cases[test_id].pattern;
 
    foreach (A_ref[i]) begin
      case (active_pattern)
@@ -875,7 +903,9 @@ module tb_mac_array_gemm;
               test_cases[c].K, test_cases[c].N, test_cases[c].M, test_cases[c].N);
 
      initialize_memories(c, test_cases[c].M, test_cases[c].K, test_cases[c].N);
-     $display("  Data pattern: %0d", active_pattern);
+     $display("  Data pattern: %0s (id=%0d)", pattern_name(active_pattern), active_pattern);
+     if (c == 8 || c == 9)
+       $display("  Cache check: A[0] and B[0] replaced with signed extremes.");
      coverage.sample();
 
      gemm_golden(test_cases[c].M, test_cases[c].K, test_cases[c].N);

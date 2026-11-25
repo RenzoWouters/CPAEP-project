@@ -9,7 +9,9 @@
 // results still in the MAC pipeline; C writes overlap following computation.
 // GeMV keeps the 16 M rows x 32 K lanes mapping. Its last SRAM response and
 // ISSUE share TopFlush; the MAC consumes the completed buffer one edge later.
-// With the default A port, this takes 8 read cycles + 1 flush/issue cycle.
+// That same accepted ISSUE prefetches word 0 of the next A tile and its B word.
+// Their responses update the buffers only after the current MAC consumption.
+// With the default A port, successive GeMV tiles can issue every 8 cycles.
 //
 // Layout (byte lane 0 is the least-significant byte):
 //   GeMM A: row-major, each row padded to 64-element words.
@@ -86,7 +88,7 @@ module gemm_accelerator_top_mac_array #(
   logic [CountWidth-1:0] M_count, K_count, N_count;
   logic is_gemv, controller_busy, controller_done;
   logic valid_data, init_save, result_valid;
-  logic start_controller, issue_phase, issue_block, accept_start;
+  logic start_controller, issue_phase, issue_block, accept_start, gemv_prefetch;
   logic controller_done_seen_q, done_q;
   logic [BeatWidth-1:0] read_beat_q;
   logic last_read, last_k_block, last_job_block, last_reuse_row;
@@ -129,6 +131,7 @@ module gemm_accelerator_top_mac_array #(
 
   logic [CalcWidth-1:0] k_blocks, a_words_per_row, c_words_per_row, m_group_base;
   logic [CalcWidth-1:0] a_word_address, b_word_address, c_base_address;
+  logic [CalcWidth-1:0] a_access_address, b_access_address;
   logic [CalcWidth-1:0] remaining_cores, remaining_inputs, remaining_rows;
   logic [CoreCountWidth-1:0] active_cores;
   logic [InputCountWidth-1:0] active_inputs;
@@ -156,6 +159,10 @@ module gemm_accelerator_top_mac_array #(
                         output_slot_busy_q && !last_c_write;
   assign issue_block = issue_phase && !output_stall;
   assign reserve_output = issue_block && last_k_block;
+  // Look ahead only when the current tile is accepted and another tile exists.
+  // A and B retain their separate SRAM ports and fixed word widths.
+  assign gemv_prefetch = is_gemv && (state_q == TopFlush) &&
+                         issue_block && !last_job_block;
   assign done_o = done_q;
 
   gemm_controller_mac_array #(
@@ -222,18 +229,25 @@ module gemm_accelerator_top_mac_array #(
         (CalcWidth'(N_count) + CalcWidth'(NumCores) >= CalcWidth'(N_size_q))));
   end
 
-  assign sram_a_addr_o = AddrWidth'(a_word_address);
-  assign sram_b_addr_o = AddrWidth'(b_word_address);
+  // TopFlush has read_beat_q == 0. GeMV A tiles are consecutive in SRAM;
+  // B advances along K and wraps to block zero for the next group of M rows.
+  // Keep current-tile counters/metadata unchanged until the accepted ISSUE.
+  assign a_access_address = gemv_prefetch ?
+    a_word_address + CalcWidth'(AReadWords) : a_word_address;
+  assign b_access_address = gemv_prefetch ?
+    (last_k_block ? '0 : b_word_address + CalcWidth'(1)) : b_word_address;
+  assign sram_a_addr_o = AddrWidth'(a_access_address);
+  assign sram_b_addr_o = AddrWidth'(b_access_address);
   always_comb begin
     a_cache_hit = 1'b0;
     if (!is_gemv && (int'(read_beat_q) < int'(active_rows)))
       a_cache_hit = a_cache_valid_q[load_row] &&
                     (a_cache_addr_q[load_row] == sram_a_addr_o);
   end
-  assign sram_a_re_o = (state_q == TopLoad) &&
-    (is_gemv || ((int'(read_beat_q) < int'(active_rows)) && !a_cache_hit));
-  assign sram_b_re_o = (state_q == TopLoad) &&
-    (is_gemv ? (read_beat_q == '0) : (int'(read_beat_q) < BReadWords));
+  assign sram_a_re_o = gemv_prefetch || ((state_q == TopLoad) &&
+    (is_gemv || ((int'(read_beat_q) < int'(active_rows)) && !a_cache_hit)));
+  assign sram_b_re_o = gemv_prefetch || ((state_q == TopLoad) &&
+    (is_gemv ? (read_beat_q == '0) : (int'(read_beat_q) < BReadWords)));
   assign last_read = is_gemv ? (read_beat_q == BeatWidth'(AReadWords-1)) :
                               (read_beat_q == BeatWidth'(GemmLoadWords-1));
 
@@ -264,13 +278,20 @@ module gemm_accelerator_top_mac_array #(
         end else read_beat_q <= read_beat_q + BeatWidth'(1);
         TopFlush: begin
           if (is_gemv) begin
-            // The final operand word is captured on this edge. The following
-            // edge consumes the complete tile and may request the next tile's
-            // first word; that response cannot overwrite the old tile earlier.
+            // Capture the final response and prefetch the next tile's word 0
+            // on this edge. On the next edge, the MAC consumes this tile before
+            // nonblocking buffer updates capture the prefetched A/B responses.
             // Stay here if the last-K result cannot reserve an output slot yet.
             if (issue_block) begin
               if (last_job_block) state_q <= TopDrain;
-              else state_q <= TopLoad;
+              else if (AReadWords == 1) begin
+                // The prefetched word is already the next tile's final word.
+                read_beat_q <= '0;
+                state_q <= TopFlush;
+              end else begin
+                read_beat_q <= BeatWidth'(1);
+                state_q <= TopLoad;
+              end
             end
           end else state_q <= TopIssue;
         end
@@ -302,11 +323,11 @@ module gemm_accelerator_top_mac_array #(
       a_response_valid_q <= sram_a_re_o;
       b_response_valid_q <= sram_b_re_o;
       if (sram_a_re_o) begin
-        a_response_beat_q <= read_beat_q;
+        a_response_beat_q <= gemv_prefetch ? '0 : read_beat_q;
         a_response_addr_q <= sram_a_addr_o;
         a_response_row_q <= load_row;
       end
-      if (sram_b_re_o) b_response_beat_q <= read_beat_q;
+      if (sram_b_re_o) b_response_beat_q <= gemv_prefetch ? '0 : read_beat_q;
       // New jobs may replace SRAM contents at unchanged addresses.
       if (accept_start) a_cache_valid_q <= '0;
       if (a_response_valid_q) begin
@@ -447,9 +468,11 @@ module gemm_accelerator_top_mac_array #(
     if (rst_ni) begin
       if (accept_start && (M_size_i == '0 || K_size_i == '0 || N_size_i == '0))
         $fatal(1, "M, K and N must be strictly positive.");
-      if ((sram_a_re_o && ((a_word_address >> AddrWidth) != '0)) ||
-          (sram_b_re_o && ((b_word_address >> AddrWidth) != '0)))
+      if ((sram_a_re_o && ((a_access_address >> AddrWidth) != '0)) ||
+          (sram_b_re_o && ((b_access_address >> AddrWidth) != '0)))
         $fatal(1, "Active SRAM word address does not fit AddrWidth.");
+      if (gemv_prefetch && read_beat_q != '0)
+        $fatal(1, "GeMV prefetch requires the current tile's base address.");
       if (reserve_output &&
           ((c_base_address +
             (CalcWidth'(active_cores)+CalcWidth'(CElements-1))/CalcWidth'(CElements) -

@@ -10,7 +10,7 @@
 // compare the new GeMM reuse schedule against the preserved original run.
 // C packs two int32 results per 64-bit word by default; GeMM rows are padded
 // independently, while GeMV packs consecutive M results into complete words.
-// GeMV flush/ISSUE overlap is compared with the saved C64/MReuse8 run.
+// GeMV prefetch is compared with the saved C64/MReuse8/GeMV9 run.
 // Phase 1: one initial reset, then all matrix cases without a DUT reset.
 // Phase 2: directed reset/abort/restart tests on the same DUT and SRAMs.
 // Both phases contribute to the same simulation's code coverage.
@@ -99,7 +99,7 @@ module tb_mac_array_gemm;
  // This is a comparison reference, not a performance assertion or new run.
  localparam int unsigned BaselineCycles [NumWorkloads] =
    '{2836, 5652, 25364, 17300, 61460, 112660};
- // Port widths deliberately change in this experiment. These references
+ // Historical references include other port widths. These references
  // compare the same required workloads and arithmetic/array dimensions.
  localparam bit HasComparableBaseline =
    (NumCores == 16) && (NumInputs == 32) &&
@@ -109,11 +109,11 @@ module tb_mac_array_gemm;
  localparam int unsigned PreviousC32Cycles [NumWorkloads] =
    '{2077, 2105, 8129, 17300, 61460, 112660};
  localparam bit HasComparableC32Reference = HasComparableBaseline && (MReuse == 4);
- // User-confirmed C64/MReuse8 run before GeMV flush/ISSUE overlap.
+ // User-confirmed C64/MReuse8/GeMV9 run before GeMV prefetch.
  // These are measured comparison values, not expected results for this run.
- localparam int unsigned PreviousC64MReuse8Cycles [NumWorkloads] =
-   '{1059, 1277, 5533, 17292, 61452, 112652};
- localparam bit HasMatchingC64MReuse8Reference = HasComparableBaseline &&
+ localparam int unsigned PreviousGeMV9Cycles [NumWorkloads] =
+   '{1059, 1277, 5533, 15564, 55308, 101388};
+ localparam bit HasMatchingGeMV9Reference = HasComparableBaseline &&
    (MReuse == 8) && (SramBDataWidth == 448) && (SramCDataWidth == 64);
 
  typedef enum int unsigned {
@@ -122,11 +122,13 @@ module tb_mac_array_gemm;
    ResetTopFlush,
    ResetTopIssue,
    ResetControllerDrain,
-   ResetDuringCWrite
+   ResetDuringCWrite,
+   ResetPrefetchPending
  } reset_target_t;
 
  localparam int unsigned NumResetTargets = 6;
- localparam int unsigned NumResetCases   = 2 * NumResetTargets; // GeMM and GeMV
+ localparam int unsigned NumResetCases   = 2 * NumResetTargets + 1;
+ // Six existing targets in both modes, plus one GeMV prefetch-in-flight reset.
 
  // Pattern IDs: 0=random, 1=zero, 2=+1, 3=-1, 4=A:-1/B:+1,
  //              5=+127, 6=-128, 7=alternating A / B:+1.
@@ -862,6 +864,13 @@ module tb_mac_array_gemm;
      num_errors++;
    end
 
+   if ((N_i == 1) &&
+       (a_reads != expected_compute_steps(M_i, K_i, N_i) * AReadWords)) begin
+     $display("ERROR: GeMV SRAM A reads=%0d, expected=%0d.",
+              a_reads, expected_compute_steps(M_i, K_i, N_i) * AReadWords);
+     num_errors++;
+   end
+
    if (b_reads != expected_b_reads(M_i, K_i, N_i, MReuse)) begin
      $display("ERROR: SRAM B reads=%0d, expected=%0d for MReuse=%0d.",
               b_reads, expected_b_reads(M_i, K_i, N_i, MReuse), MReuse);
@@ -884,6 +893,7 @@ module tb_mac_array_gemm;
      ResetTopIssue:        return "ISSUE of second K block";
      ResetControllerDrain: return "ControllerDrain";
      ResetDuringCWrite:    return "partial C write in TopDrain";
+     ResetPrefetchPending: return "prefetched A/B response pending";
      default:             return "unknown reset target";
    endcase
  endfunction
@@ -909,6 +919,14 @@ module tb_mac_array_gemm;
        return (i_dut.state_q === i_dut.TopDrain) &&
               (sram_c_we === 1'b1) && (i_dut.c_core_q != '0) &&
               (c_writes > 0) && (c_writes < c_used_words);
+     ResetPrefetchPending:
+       // The next tile's word zero is in flight while the preceding tile
+       // awaits MAC consumption. Initial word-zero loading has valid_data=0.
+       return (i_dut.is_gemv === 1'b1) &&
+              (i_dut.a_response_valid_q === 1'b1) &&
+              (i_dut.b_response_valid_q === 1'b1) &&
+              (i_dut.a_response_beat_q == '0) &&
+              (i_dut.valid_data === 1'b1);
      default: return 1'b0;
    endcase
  endfunction
@@ -1083,6 +1101,7 @@ module tb_mac_array_gemm;
        run_reset_case(reset_target_t'(r), mode == 1);
      end
    end
+   run_reset_case(ResetPrefetchPending, 1'b1);
  endtask
 
  //---------------------------
@@ -1143,6 +1162,12 @@ module tb_mac_array_gemm;
 
                      active_case_name, sram_a_addr, a_used_words);
 
+         // GeMV A tiles occupy consecutive complete words. Check the order
+         // independently of DUT counters, including prefetched words.
+         if ((N_i == 1) && (longint'(sram_a_addr) != a_reads))
+           $fatal(1, "[%0s] GeMV A read %0d: address=%0d, expected=%0d.",
+                  active_case_name, a_reads, sram_a_addr, a_reads);
+
          a_reads++;
 
        end
@@ -1154,6 +1179,14 @@ module tb_mac_array_gemm;
            $fatal(1, "[%0s] Invalid B word address %0h (used words=%0d).",
 
                      active_case_name, sram_b_addr, b_used_words);
+
+         // Each M group traverses all K slices of the shared B vector once.
+         if ((N_i == 1) &&
+             (longint'(sram_b_addr) !=
+              b_reads % ((longint'(K_i) + NumInputs - 1) / NumInputs)))
+           $fatal(1, "[%0s] GeMV B read %0d: address=%0d, expected=%0d.",
+                  active_case_name, b_reads, sram_b_addr,
+                  b_reads % ((longint'(K_i) + NumInputs - 1) / NumInputs));
 
          b_reads++;
 
@@ -1453,18 +1486,18 @@ module tb_mac_array_gemm;
  // Compare all five requested metrics for each of the six required workloads.
  // The saved reference uses all 512 lanes on every accepted compute cycle,
  // so its spatial utilization is 100% and temporal equals total utilization.
- task automatic print_c64_mreuse8_comparison();
+ task automatic print_gemv9_comparison();
    real operations, reference_normalized, current_normalized, reference_util;
    real reference_normalized_sum, current_normalized_sum, reference_util_sum;
    real current_spatial_sum, current_temporal_sum, current_total_sum;
 
-   if (!HasMatchingC64MReuse8Reference) begin
-     $display(" C64/MReuse8 comparison omitted: hardware parameters differ from the saved reference.");
+   if (!HasMatchingGeMV9Reference) begin
+     $display(" C64/MReuse8/GeMV9 comparison omitted: hardware parameters differ from the saved reference.");
      return;
    end
    for (int unsigned c = 0; c < NumWorkloads; c++) begin
      if (case_errors[c] != 0) begin
-       $display(" C64/MReuse8 comparison INVALID: a required workload failed.");
+       $display(" C64/MReuse8/GeMV9 comparison INVALID: a required workload failed.");
        return;
      end
    end
@@ -1476,18 +1509,18 @@ module tb_mac_array_gemm;
    current_temporal_sum = 0.0;
    current_total_sum = 0.0;
 
-   $display("\n COMPARISON -- saved C64/MReuse8 reference versus current run");
-   $display(" Reference: A/B/C=512/448/64 bits, MReuse=8, before GeMV flush/ISSUE overlap.");
+   $display("\n COMPARISON -- saved C64/MReuse8/GeMV9 reference versus current run");
+   $display(" Reference: A/B/C=512/448/64 bits, MReuse=8, before GeMV prefetch.");
    $display(" %s | %10s | %10s | %16s | %16s",
             pad("Case", 14), "Cycles ref", "Cycles now", "Cycles/MKN ref", "Cycles/MKN now");
    for (int unsigned c = 0; c < NumWorkloads; c++) begin
      operations = real'(test_cases[c].M) * real'(test_cases[c].K) * real'(test_cases[c].N);
-     reference_normalized = real'(PreviousC64MReuse8Cycles[c]) / operations;
+     reference_normalized = real'(PreviousGeMV9Cycles[c]) / operations;
      current_normalized = real'(case_cycles[c]) / operations;
      reference_normalized_sum += reference_normalized;
      current_normalized_sum += current_normalized;
      $display(" %s | %10d | %10d | %16.9f | %16.9f",
-              pad(test_cases[c].name, 14), PreviousC64MReuse8Cycles[c], case_cycles[c],
+              pad(test_cases[c].name, 14), PreviousGeMV9Cycles[c], case_cycles[c],
               reference_normalized, current_normalized);
    end
 
@@ -1495,7 +1528,7 @@ module tb_mac_array_gemm;
             pad("Case", 14), "Spatial ref", "Spatial now", "Temp. ref", "Temp. now", "Total ref", "Total now");
    for (int unsigned c = 0; c < NumWorkloads; c++) begin
      operations = real'(test_cases[c].M) * real'(test_cases[c].K) * real'(test_cases[c].N);
-     reference_util = 100.0 * operations / (512.0 * real'(PreviousC64MReuse8Cycles[c]));
+     reference_util = 100.0 * operations / (512.0 * real'(PreviousGeMV9Cycles[c]));
      reference_util_sum += reference_util;
      current_spatial_sum += case_spatial_util[c];
      current_temporal_sum += case_temporal_util[c];
@@ -1508,10 +1541,10 @@ module tb_mac_array_gemm;
             pad("Mean", 14), 100.0, current_spatial_sum / real'(NumWorkloads),
             reference_util_sum / real'(NumWorkloads), current_temporal_sum / real'(NumWorkloads),
             reference_util_sum / real'(NumWorkloads), current_total_sum / real'(NumWorkloads));
-   $display(" C64/MReuse8 mean normalized latency: reference=%.9f, current=%.9f cycles/MAC.",
+   $display(" C64/MReuse8/GeMV9 mean normalized latency: reference=%.9f, current=%.9f cycles/MAC.",
             reference_normalized_sum / real'(NumWorkloads),
             current_normalized_sum / real'(NumWorkloads));
-   $display(" Measured reduction versus saved C64/MReuse8: %0.2f%% (positive is better).",
+   $display(" Measured reduction versus saved C64/MReuse8/GeMV9: %0.2f%% (positive is better).",
             100.0 * (1.0 - current_normalized_sum / reference_normalized_sum));
  endtask
 
@@ -1611,7 +1644,7 @@ module tb_mac_array_gemm;
 
    end
 
-   print_c64_mreuse8_comparison();
+   print_gemv9_comparison();
 
    $display("\n REUSE / OUTPUT-BANDWIDTH DIAGNOSTICS -- six required workloads");
    $display(" %s | %10s | %10s | %10s | %10s | %10s",

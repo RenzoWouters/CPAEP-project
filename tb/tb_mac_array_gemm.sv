@@ -4,7 +4,7 @@
 // Each physical read OR write consumes its complete 128-bit bank word.
 // Phase 1: all matrix jobs, including all six random-data reruns, without reset.
 // Phase 2: directed abort/reset/restart tests on the SAME DUT and memories.
-// Phase 3: post-report bank SRAM port/branch/condition/toggle coverage sweep.
+// Phase 3: post-report SRAM port/toggle tests using legal read OR write cycles.
 // Logical row-major golden matrices are independent of the banked layout.
 //-----------------------------------------------------------------------------
 module tb_mac_array_gemm;
@@ -17,7 +17,7 @@ module tb_mac_array_gemm;
   parameter int unsigned NumInputs = 32;
   parameter int unsigned GemmRows = 2;
   parameter int unsigned MReuse = 64;
-  parameter int unsigned OutputQueueDepth = 25;
+  parameter int unsigned OutputQueueDepth = 20;
   parameter int unsigned NumBanks = 8;
   parameter int unsigned BankDataWidth = 128;
   parameter int unsigned VectorCacheElements = 2048;
@@ -44,8 +44,8 @@ module tb_mac_array_gemm;
   localparam int unsigned NumWorkloads = 6;
   localparam int unsigned NumCases = 69;
   localparam int unsigned PreviousCycles[NumWorkloads] =
-    '{582, 646, 2438, 8517, 30257, 55463};
-  localparam real PreviousArea = 2658.21875;
+    '{302, 558, 2350, 6971, 24686, 45166};
+  localparam real PreviousArea = 3152.0;
 
   typedef struct {
     string name;
@@ -184,10 +184,10 @@ module tb_mac_array_gemm;
   logic [NumBanks-1:0] bank_re, bank_we;
   logic [NumBanks-1:0][BankDataWidth-1:0] bank_rdata, bank_wdata;
 
-  // Post-report SRAM coverage exercise signals (kept 0 during Phases 1 & 2)
-  logic                                   sram_tb_override;
-  logic [NumBanks-1:0][AddrWidth-1:0]     tb_bank_addr;
-  logic [NumBanks-1:0]                    tb_bank_re, tb_bank_we;
+  // SRAM coverage controls stay inactive throughout the matrix/reset tests.
+  logic sram_tb_override;
+  logic [NumBanks-1:0][AddrWidth-1:0] tb_bank_addr;
+  logic [NumBanks-1:0] tb_bank_re, tb_bank_we;
   logic [NumBanks-1:0][BankDataWidth-1:0] tb_bank_wdata;
 
   logic signed [InDataWidth-1:0] A_ref[], B_ref[];
@@ -876,102 +876,156 @@ module tb_mac_array_gemm;
   endtask
 
   //---------------------------------------------------------------------------
-  // Phase 3: Post-report SRAM port, branch, condition, and toggle coverage
+  // Phase 3: SRAM coverage after the complete accelerator performance report.
+  // No simultaneous read/write stimulus: it is forbidden by the project and
+  // deliberately rejected by the unchanged SRAM module's $error check.
   //---------------------------------------------------------------------------
+  always @(posedge clk_i) begin : monitor_sram_override
+    int unsigned active_banks;
+    if (sram_tb_override) begin
+      // These are the actual SRAM port controls selected by the TB muxes.
+      if (monitor_active || queue_observation_active || start ||
+          bank_re !== '0 || bank_we !== '0 || done !== 1'b0)
+        $fatal(1, "SRAM test override overlaps accelerator activity.");
+      if ($isunknown({tb_bank_re, tb_bank_we}))
+        $fatal(1, "Unknown SRAM test enables.");
+      active_banks = 0;
+      for (int b = 0; b < NumBanks; b++) begin
+        if (tb_bank_re[b] && tb_bank_we[b])
+          $fatal(1, "SRAM test bank %0d reads and writes in the same cycle.", b);
+        if (tb_bank_re[b] || tb_bank_we[b]) begin
+          active_banks++;
+          if ($isunknown(tb_bank_addr[b]) || int'(tb_bank_addr[b]) >= DataDepth)
+            $fatal(1, "SRAM test bank %0d has an invalid active address.", b);
+        end
+        if (tb_bank_we[b] && $isunknown(tb_bank_wdata[b]))
+          $fatal(1, "SRAM test bank %0d writes unknown data.", b);
+      end
+      if (active_banks * BankDataWidth > 1024)
+        $fatal(1, "SRAM test exceeds 1024 bits per cycle.");
+    end
+  end
+
+  task automatic check_sram_read_data(
+    input logic [BankDataWidth-1:0] expected,
+    input string phase_label
+  );
+    for (int b = 0; b < NumBanks; b++) begin
+      if (bank_rdata[b] !== expected)
+        $fatal(1, "SRAM bank %0d mismatch during %0s: got %0h, expected %0h.",
+               b, phase_label, bank_rdata[b], expected);
+    end
+  endtask
+
   task automatic run_sram_coverage_exercise();
+    logic [BankDataWidth-1:0] pat;
+    logic [NumBanks-1:0][BankDataWidth-1:0] held_rdata;
     $display("\n==========================================");
     $display(" PHASE 3: BANKED SRAM COVERAGE EXERCISE");
     $display("==========================================");
 
     @(negedge clk_i);
+    if (rst_ni !== 1'b1 || i_dut.state_q !== i_dut.TopIdle ||
+        monitor_active || queue_observation_active || start ||
+        bank_re !== '0 || bank_we !== '0 || done !== 1'b0)
+      $fatal(1, "SRAM coverage exercise requires an idle accelerator.");
+    active_case_name = "SRAM coverage exercise";
+    tb_bank_addr = '0;
+    tb_bank_re = '0;
+    tb_bank_we = '0;
+    tb_bank_wdata = '0;
     sram_tb_override = 1'b1;
-    for (int b = 0; b < NumBanks; b++) begin
-      tb_bank_addr[b]  = '0;
-      tb_bank_re[b]    = 1'b0;
-      tb_bank_we[b]    = 1'b0;
-      tb_bank_wdata[b] = '0;
-    end
 
-    // 1. Toggle all AddrWidth bits (0 -> '1 -> 0) across all 8 banks
+    // Toggle all address-port bits without accessing memory. The all-ones
+    // address may exceed DataDepth; both enables remain zero throughout.
+    held_rdata = bank_rdata;
     @(posedge clk_i); #1;
-    @(negedge clk_i);
-    for (int b = 0; b < NumBanks; b++) tb_bank_addr[b] = '1;
+    @(negedge clk_i); tb_bank_addr = '1;
     @(posedge clk_i); #1;
-    @(negedge clk_i);
-    for (int b = 0; b < NumBanks; b++) tb_bank_addr[b] = '0;
+    if (bank_rdata !== held_rdata)
+      $fatal(1, "SRAM output changed during a disabled address toggle.");
+    @(negedge clk_i); tb_bank_addr = '0;
     @(posedge clk_i); #1;
+    if (bank_rdata !== held_rdata)
+      $fatal(1, "SRAM output changed while both enables were low.");
 
-    // 2. Write, read back, and hold '0, '1, and alternating patterns on all 8 banks
-    for (int unsigned step = 0; step < 4; step++) begin
-      logic [BankDataWidth-1:0] pat;
+    // Write/read/hold zeros, ones and both alternating patterns in every bank.
+    for (int unsigned step = 0; step < 5; step++) begin
       case (step)
         0: pat = '0;
         1: pat = '1;
-        2: pat = {BankDataWidth{2'b10}};
-        3: pat = '0;
+        2: pat = {(BankDataWidth/2){2'b10}};
+        3: pat = {(BankDataWidth/2){2'b01}};
+        default: pat = '0;
       endcase
+      held_rdata = bank_rdata;
 
-      // Write cycle (mem_we_i = 1, mem_re_i = 0)
       @(negedge clk_i);
+      tb_bank_addr = '0;
+      tb_bank_re = '0;
+      tb_bank_we = '1;
+      for (int b = 0; b < NumBanks; b++) tb_bank_wdata[b] = pat;
+      @(posedge clk_i); #1;
+      if (bank_rdata !== held_rdata)
+        $fatal(1, "SRAM read output changed during a write-only cycle.");
+
+      @(negedge clk_i);
+      tb_bank_we = '0;
+      tb_bank_re = '1;
+      #1;
+      if (bank_rdata !== held_rdata)
+        $fatal(1, "SRAM read output changed before the accepting clock edge.");
+      @(posedge clk_i); #1;
+      check_sram_read_data(pat, $sformatf("read pattern %0d", step));
+
+      @(negedge clk_i);
+      tb_bank_re = '0;
       for (int b = 0; b < NumBanks; b++) begin
-        tb_bank_addr[b]  = '0;
-        tb_bank_wdata[b] = pat;
-        tb_bank_we[b]    = 1'b1;
-        tb_bank_re[b]    = 1'b0;
+        tb_bank_addr[b] = AddrWidth'(DataDepth-1);
+        tb_bank_wdata[b] = ~pat;
       end
       @(posedge clk_i); #1;
-
-      // Read cycle (mem_re_i = 1, mem_we_i = 0)
-      @(negedge clk_i);
-      for (int b = 0; b < NumBanks; b++) begin
-        tb_bank_we[b] = 1'b0;
-        tb_bank_re[b] = 1'b1;
-      end
-      @(posedge clk_i); #1;
-
-      for (int b = 0; b < NumBanks; b++) begin
-        if (bank_rdata[b] !== pat)
-          $fatal(1, "Bank %0d loopback mismatch at step %0d.", b, step);
-      end
-
-      // Hold cycle (mem_re_i = 0, mem_we_i = 0)
-      @(negedge clk_i);
-      for (int b = 0; b < NumBanks; b++) tb_bank_re[b] = 1'b0;
-      @(posedge clk_i); #1;
+      check_sram_read_data(pat, $sformatf("hold pattern %0d", step));
     end
 
-    // 3. Simultaneous read + write (mem_we_i = 1, mem_re_i = 1) with all-1s
+    // Prepare an all-ones read output with separate write and read cycles.
     @(negedge clk_i);
-    for (int b = 0; b < NumBanks; b++) begin
-      tb_bank_wdata[b] = '1;
-      tb_bank_we[b]    = 1'b1;
-      tb_bank_re[b]    = 1'b1;
-    end
+    tb_bank_addr = '0;
+    tb_bank_wdata = '1;
+    tb_bank_we = '1;
     @(posedge clk_i); #1;
-
-    // Read back all-1s so mem_rd_data_o is '1 immediately before reset
     @(negedge clk_i);
-    for (int b = 0; b < NumBanks; b++) begin
-      tb_bank_we[b] = 1'b0;
-      tb_bank_re[b] = 1'b1;
-    end
+    tb_bank_we = '0;
+    tb_bank_re = '1;
     @(posedge clk_i); #1;
+    check_sram_read_data('1, "read before reset");
 
-    // 4. Assert reset while bank_rdata == '1 to cover reset branch & 1->0 output toggle
+    // Reset clears the registered output asynchronously, not the SRAM contents.
     @(negedge clk_i);
-    for (int b = 0; b < NumBanks; b++) tb_bank_re[b] = 1'b0;
+    tb_bank_re = '0;
     rst_ni = 1'b0;
+    #1;
+    check_sram_read_data('0, "asynchronous reset assertion");
     @(posedge clk_i); #1;
-    @(negedge clk_i);
-    rst_ni = 1'b1;
+    check_sram_read_data('0, "reset hold");
+    @(negedge clk_i); rst_ni = 1'b1;
     @(posedge clk_i); #1;
+    check_sram_read_data('0, "reset release without read");
 
-    // Restore normal DUT ownership
+    @(negedge clk_i); tb_bank_re = '1;
+    @(posedge clk_i); #1;
+    check_sram_read_data('1, "memory contents retained across reset");
+
     @(negedge clk_i);
-    for (int b = 0; b < NumBanks; b++) tb_bank_wdata[b] = '0;
+    tb_bank_re = '0;
+    tb_bank_we = '0;
+    tb_bank_addr = '0;
+    tb_bank_wdata = '0;
     sram_tb_override = 1'b0;
     @(posedge clk_i); #1;
-    $display("[SRAM COV] PASS: all 8 SRAM banks exercised across ports, branches, and toggles.");
+    check_reset_idle("after SRAM coverage exercise");
+    $display("[SRAM COV] PASS: all %0d banks passed read/write, latency, hold and reset checks.", NumBanks);
+    $display("[SRAM COV] Only legal read OR write cycles used; no error-branch stimulus.");
   endtask
 
   function automatic string pad(input string str,input int unsigned width);
@@ -983,8 +1037,8 @@ module tb_mac_array_gemm;
     real ops,ref_norm,now_norm,ref_util,ref_sum,now_sum,ref_util_sum;
     real spatial_sum,temporal_sum,total_sum;
     ref_sum=0;now_sum=0;ref_util_sum=0;spatial_sum=0;temporal_sum=0;total_sum=0;
-    $display("\n COMPARISON -- accepted compact Q25 versus eight physical128-bit banks");
-    $display(" Reference: A/B/C=832/64/128 bits,2Mx8Nx32K,MReuse64,Q25,compact GeMV A.");
+    $display("\n COMPARISON -- banked Q25 versus current Q%0d",OutputQueueDepth);
+    $display(" Reference: 8x128-bit banks,2Mx8Nx32K,MReuse64,Q25,2048-byte GeMV B cache.");
     $display(" %s | %10s | %10s | %16s | %16s",pad("Case",14),"Cycles ref","Cycles now","Cycles/MKN ref","Cycles/MKN now");
     for(int c=0;c<NumWorkloads;c++) begin
       ops=real'(test_cases[c].M)*real'(test_cases[c].K)*real'(test_cases[c].N);
@@ -1001,7 +1055,7 @@ module tb_mac_array_gemm;
     end
     $display(" %s | %10.2f%% | %10.2f%% | %10.2f%% | %10.2f%% | %10.2f%% | %10.2f%%",pad("Mean",14),100.0,spatial_sum/NumWorkloads,ref_util_sum/NumWorkloads,temporal_sum/NumWorkloads,ref_util_sum/NumWorkloads,total_sum/NumWorkloads);
     $display(" Mean normalized latency: reference=%.9f,current=%.9f cycles/MAC.",ref_sum/NumWorkloads,now_sum/NumWorkloads);
-    $display(" Measured reduction versus compact Q25: %0.2f%% (positive is better).",100.0*(1.0-now_sum/ref_sum));
+    $display(" Measured reduction versus banked Q25: %0.2f%% (positive is better).",100.0*(1.0-now_sum/ref_sum));
   endtask
 
   task automatic print_report();
@@ -1034,7 +1088,7 @@ module tb_mac_array_gemm;
     for(int c=0;c<NumWorkloads;c++)
       $display(" %s | %10d | %10d | %10d | %12d | %10d | %10d",pad(test_cases[c].name,14),case_a_reads[c],case_b_reads[c],case_c_writes[c],case_write_cycles[c],case_output_stalls[c],case_queue_peak[c]);
     $display(" Logged area: %0.2f area units",metrics_pkg::area);
-    $display(" Compact Q25 area reference: %.5f; current: %.5f; change: %.2f%%.",PreviousArea,metrics_pkg::area,100.0*(metrics_pkg::area/PreviousArea-1.0));
+    $display(" Banked Q25 area reference: %.5f; current: %.5f; change: %.2f%%.",PreviousArea,metrics_pkg::area,100.0*(metrics_pkg::area/PreviousArea-1.0));
     $display(" Queue observations: head wraps=%0d,tail wraps=%0d,full pop/reserve=%0d.",queue_head_wraps,queue_tail_wraps,queue_full_replacements);
     $display(" Bank observations: paired GeMV writes=%0d,GeMV write-pause cycles=%0d,read/write direction switches=%0d.",paired_c_writes,gemv_c_pause_events,bank_direction_switches);
     $display(" Bank timing observations: paired wrap=%0d,prefetch/C conflict=%0d,pending A response/C overlap=%0d.",paired_queue_wraps,prefetch_write_conflicts,response_write_overlap);

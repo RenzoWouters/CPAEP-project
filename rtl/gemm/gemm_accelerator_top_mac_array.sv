@@ -33,7 +33,7 @@ module gemm_accelerator_top_mac_array #(
   parameter int unsigned VectorCacheElements = 2048,
   parameter int unsigned GemmRows       = 2,
   parameter int unsigned MReuse         = 64,
-  parameter int unsigned OutputQueueDepth = 25
+  parameter int unsigned OutputQueueDepth = 20
 ) (
   input  logic                            clk_i,
   input  logic                            rst_ni,

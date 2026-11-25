@@ -80,7 +80,7 @@ module tb_mac_array_gemm;
 
  localparam int unsigned NumWorkloads = 6;
 
- localparam int unsigned NumCases     = 34;
+ localparam int unsigned NumCases     = 37;
 
  // Pattern IDs: 0=random, 1=zero, 2=+1, 3=-1, 4=A:-1/B:+1,
  //              5=+127, 6=-128, 7=alternating A / B:+1.
@@ -135,7 +135,12 @@ module tb_mac_array_gemm;
    '{"GeMM 3 random",    64,  576, 32, 0},
    '{"GeMV 1 random",  1536,  576,  1, 0},
    '{"GeMV 2 random",  3072, 1024,  1, 0},
-   '{"GeMV 3 random",  2816, 2048,  1, 0}
+   '{"GeMV 3 random",  2816, 2048,  1, 0},
+
+   // Target the three functional-coverage gaps measured in iteration 5.
+   '{"GeMM N15",          2,   64, 15, 0}, // cp_N.below_16
+   '{"GeMV K32",         16,   32,  1, 0}, // GeMV x cp_K.exact_32
+   '{"GeMV K61",         16,   61,  1, 0}  // GeMV x cp_K.above_60
  };
 
  int unsigned     case_cycles [NumCases];
@@ -1025,12 +1030,13 @@ module tb_mac_array_gemm;
    $display("\n==========================================");
    $display(" FUNCTIONAL COVERAGE");
    $display("==========================================");
-   $display("Overall coverage: %0.2f%%", coverage.get_coverage());
+   $display("Covergroup total: %0.2f%%", coverage.get_coverage());
    $display("Mode coverage:    %0.2f%%", coverage.cp_mode.get_coverage());
    $display("K coverage:       %0.2f%%", coverage.cp_K.get_coverage());
    $display("M coverage:       %0.2f%%", coverage.cp_M.get_coverage());
    $display("N coverage:       %0.2f%%", coverage.cp_N.get_coverage());
    $display("Pattern coverage: %0.2f%%", coverage.cp_pattern.get_coverage());
+   $display("Mode x K cross:   %0.2f%%", coverage.mode_k_cross.get_coverage());
    $display("==========================================");
 
    $finish;

@@ -12,16 +12,22 @@
 // operand is consumed at the next edge BEFORE the replacement response's NBA.
 // Explicit MAC bank/slot registers preserve that one-edge ownership extension.
 //
-// GeMV retains 16 M rows x 32 K lanes. Five A reads and four B reads run in
-// parallel; the last response and issue share TopFlush. That accepted issue
-// also prefetches word zero of the next tile. No SRAM-data-to-MAC bypass exists.
+// GeMV retains 16 M rows x 32 K lanes. Its A tiles form one compact stream:
+// thirteen 512-byte tiles occupy 64 A832 words, instead of 65 padded words.
+// Four or five new A reads and four B reads run in parallel. The last response
+// and issue share TopFlush; that accepted issue prefetches the next tile.
+// shared_q[1], unused by GeMV's B vector, retains the A bytes past a tile end.
+// The following edge consumes the old tile BEFORE seeding the next via NBA.
+// No SRAM-data-to-MAC bypass or additional tile buffer is introduced.
 //
 // Packing, low byte/element first (all padding is stored and read as full words):
 //   GeMM A: [M row pair][K block][row within pair][K lane]. One A832 word
 //           contains 64 payload bytes and 40 padding bytes.
 //   GeMM B: [N tile of 8][K block][column within tile][K lane].
 //           A 256-byte tile occupies 32 B64 words.
-//   GeMV A: [M tile of 16][K block][core][K lane], 5 A832 words/tile.
+//   GeMV A: [M tile of 16][K block][core][K lane], concatenated without
+//           inter-tile word padding. Only the final physical word is padded.
+//           Partial M/K tiles still contain 512 elements; invalid lanes mask.
 //   GeMV B: [K block][K lane], 4 B64 words/32-element vector fragment.
 //   GeMM C: row-major int32, each row padded to a whole C128 word.
 //   GeMV C: consecutive int32 results, padded only at the end of the vector.
@@ -85,6 +91,10 @@ module gemm_accelerator_top_mac_array #(
   localparam int unsigned StepWidth = (MaxStep <= 1) ? 1 : $clog2(MaxStep);
   localparam int unsigned CountWidth = ((SizeAddrWidth > StepWidth) ? SizeAddrWidth : StepWidth) + 1;
   localparam int unsigned CalcWidth = 2*CountWidth + 2;
+  localparam int unsigned CarryWidth = (AElements <= 1) ? 1 : $clog2(AElements);
+  localparam int unsigned TileOffsetWidth = (TileElements <= 1) ? 1 : $clog2(TileElements);
+  localparam int unsigned GemvWholeWords = TileElements / AElements;
+  localparam int unsigned GemvRemainder = TileElements % AElements;
 
   // Encodings retained for the integration testbench's reset phase probes.
   typedef enum logic [2:0] {
@@ -99,6 +109,18 @@ module gemm_accelerator_top_mac_array #(
   logic last_k_block, last_reuse_row, last_job_block;
   logic gemv_prefetch, gemm_release_bank, controller_done_seen_q, done_q;
   logic [BeatWidth-1:0] read_beat_q;
+
+  // Compact GeMV A stream. The prefix count belongs to the CURRENT logical
+  // tile; the final response leaves the NEXT prefix in shared_q[1]. Seed that
+  // prefix only one edge after the current tile's accepted issue. The wide
+  // physical word cursor also permits an overflow check before port narrowing.
+  logic [CalcWidth-1:0] gemv_a_word_q;
+  logic [CarryWidth-1:0] gemv_carry_count_q;
+  logic [TileOffsetWidth-1:0] gemv_a_response_offset_q;
+  logic gemv_seed_q;
+  int unsigned gemv_a_words, gemv_load_words;
+  int unsigned gemv_next_carry, gemv_next_a_words, gemv_next_load_words;
+  int unsigned gemv_a_request_offset;
 
   // GeMM B producer. Valid means a COMPLETE tile, not just a reserved bank.
   logic [1:0] b_valid_q;
@@ -244,24 +266,60 @@ module gemm_accelerator_top_mac_array #(
   assign gemm_b_request = active_job && !is_gemv && !b_fetch_done_q &&
     (!b_valid_q[b_fetch_bank_q] || (gemm_release_bank && (b_fetch_bank_q == b_compute_bank_q)));
 
+  // A carried prefix reduces the number of new words needed by a tile.
+  // AElements may exceed TileElements in smaller parameterized arrays: then
+  // a tile can use only carried bytes, while B still sets a >=1-cycle load.
+  always_comb begin
+    // The division/remainder above are design-time constants. Only a compare
+    // and addition/subtraction are needed as the prefix changes at run time.
+    if (int'(gemv_carry_count_q) < GemvRemainder) begin
+      gemv_a_words = GemvWholeWords+1;
+      gemv_next_carry = int'(gemv_carry_count_q)+AElements-GemvRemainder;
+    end else begin
+      gemv_a_words = GemvWholeWords;
+      gemv_next_carry = int'(gemv_carry_count_q)-GemvRemainder;
+    end
+    gemv_load_words = (gemv_a_words > VectorReadWords) ? gemv_a_words : VectorReadWords;
+    gemv_next_a_words = GemvWholeWords + ((gemv_next_carry < GemvRemainder) ? 1 : 0);
+    gemv_next_load_words = (gemv_next_a_words > VectorReadWords) ?
+                           gemv_next_a_words : VectorReadWords;
+    gemv_a_request_offset = gemv_prefetch ? gemv_next_carry :
+                            int'(gemv_carry_count_q)+int'(read_beat_q)*AElements;
+  end
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      gemv_a_word_q <= '0;
+      gemv_carry_count_q <= '0;
+      gemv_seed_q <= 1'b0;
+    end else if (accept_start) begin
+      gemv_a_word_q <= '0;
+      gemv_carry_count_q <= '0;
+      gemv_seed_q <= 1'b0;
+    end else begin
+      gemv_seed_q <= gemv_prefetch;
+      if (is_gemv && sram_a_re_o)
+        gemv_a_word_q <= gemv_a_word_q + CalcWidth'(1);
+      if (gemv_prefetch)
+        gemv_carry_count_q <= CarryWidth'(gemv_next_carry);
+    end
+  end
+
   always_comb begin
     sram_a_re_o = 1'b0;
     sram_b_re_o = 1'b0;
     a_access_address = '0;
     b_access_address = '0;
     if (is_gemv) begin
-      a_access_address = ((CalcWidth'(M_count)/CalcWidth'(NumCores))*k_blocks +
-                           CalcWidth'(K_count)/CalcWidth'(NumInputs))*CalcWidth'(AReadWords);
+      a_access_address = gemv_a_word_q;
       b_access_address = (CalcWidth'(K_count)/CalcWidth'(NumInputs))*CalcWidth'(VectorReadWords);
       if (gemv_prefetch) begin
-        a_access_address += CalcWidth'(AReadWords);
         b_access_address = last_k_block ? '0 : b_access_address+CalcWidth'(VectorReadWords);
-        sram_a_re_o = 1'b1;
+        sram_a_re_o = (gemv_next_a_words != 0);
         sram_b_re_o = 1'b1;
       end else if (state_q == TopLoad) begin
-        a_access_address += CalcWidth'(read_beat_q);
         b_access_address += CalcWidth'(read_beat_q);
-        sram_a_re_o = (int'(read_beat_q) < AReadWords);
+        sram_a_re_o = (int'(read_beat_q) < gemv_a_words);
         sram_b_re_o = (int'(read_beat_q) < VectorReadWords);
       end
     end else begin
@@ -298,7 +356,7 @@ module gemm_accelerator_top_mac_array #(
         TopStart: state_q <= TopLoad;
         TopLoad: begin
           if (is_gemv) begin
-            if (read_beat_q == BeatWidth'(GemvLoadWords-1)) begin
+            if (read_beat_q == BeatWidth'(gemv_load_words-1)) begin
               read_beat_q <= '0; state_q <= TopFlush;
             end else read_beat_q <= read_beat_q + BeatWidth'(1);
           end else if (gemm_b_request && b_fetch_last_word) state_q <= TopFlush;
@@ -306,7 +364,7 @@ module gemm_accelerator_top_mac_array #(
         TopFlush: if (issue_block) begin
           if (last_job_block) state_q <= TopDrain;
           else if (!is_gemv) state_q <= TopIssue;
-          else if (GemvLoadWords == 1) begin
+          else if (gemv_next_load_words == 1) begin
             read_beat_q <= '0; state_q <= TopFlush;
           end else begin
             read_beat_q <= BeatWidth'(1); state_q <= TopLoad;
@@ -405,6 +463,7 @@ module gemm_accelerator_top_mac_array #(
       a_response_valid_q <= 1'b0; b_response_valid_q <= 1'b0;
       a_response_beat_q <= '0; b_response_beat_q <= '0;
       a_response_slot_q <= 1'b0; b_response_bank_q <= 1'b0;
+      gemv_a_response_offset_q <= '0;
       tile_q <= '0; shared_q <= '0;
     end else begin
       a_response_valid_q <= sram_a_re_o;
@@ -412,17 +471,35 @@ module gemm_accelerator_top_mac_array #(
       if (sram_a_re_o) begin
         a_response_beat_q <= gemv_prefetch ? '0 : read_beat_q;
         a_response_slot_q <= a_tail_q;
+        if (is_gemv)
+          gemv_a_response_offset_q <= TileOffsetWidth'(gemv_a_request_offset);
       end
       if (sram_b_re_o) begin
         b_response_beat_q <= is_gemv ? (gemv_prefetch ? '0 : read_beat_q) : b_fetch_beat_q;
         b_response_bank_q <= b_fetch_bank_q;
       end
+      // The previous tile is consumed by the MAC on this edge. Only its NBA
+      // replacement may seed the next tile, including when C delayed issue.
+      // Prefix and new response occupy disjoint positions in that next tile.
+      if (gemv_seed_q) begin
+        for (int lane=0; lane<AElements; lane++)
+          if ((lane < int'(gemv_carry_count_q)) && (lane < TileElements))
+            tile_q[lane*InDataWidth +: InDataWidth]
+              <= shared_q[1][lane*InDataWidth +: InDataWidth];
+        // For a small array an A word can span several complete tiles.
+        if (int'(gemv_carry_count_q) >= TileElements)
+          shared_q[1] <= shared_q[1] >> ((TileBits < SramADataWidth) ? TileBits : 0);
+      end
       if (a_response_valid_q) begin
         if (is_gemv) begin
-          for (int lane=0; lane<AElements; lane++)
-            if (int'(a_response_beat_q)*AElements+lane < TileElements)
-              tile_q[(int'(a_response_beat_q)*AElements+lane)*InDataWidth +: InDataWidth]
+          for (int lane=0; lane<AElements; lane++) begin
+            if (int'(gemv_a_response_offset_q)+lane < TileElements)
+              tile_q[(int'(gemv_a_response_offset_q)+lane)*InDataWidth +: InDataWidth]
                 <= sram_a_rdata_i[lane*InDataWidth +: InDataWidth];
+            else
+              shared_q[1][(int'(gemv_a_response_offset_q)+lane-TileElements)*InDataWidth +: InDataWidth]
+                <= sram_a_rdata_i[lane*InDataWidth +: InDataWidth];
+          end
         end else shared_q[a_response_slot_q] <= sram_a_rdata_i;
       end
       if (b_response_valid_q) begin
@@ -591,6 +668,14 @@ module gemm_accelerator_top_mac_array #(
         $fatal(1, "A MAC result would overwrite a pending output entry.");
       if (gemv_prefetch && read_beat_q != '0)
         $fatal(1, "GeMV prefetch must start at the next tile's first word.");
+      if (is_gemv && (int'(gemv_carry_count_q) >= AElements))
+        $fatal(1, "GeMV carried prefix exceeds one physical A word.");
+      if (is_gemv && sram_a_re_o && (gemv_a_request_offset >= TileElements))
+        $fatal(1, "GeMV A request has no space in the current tile.");
+      if (gemv_seed_q && (!is_gemv || !valid_data))
+        $fatal(1, "GeMV carry seed is not aligned with consumption of the old tile.");
+      if (gemv_seed_q && (int'(gemv_carry_count_q) >= TileElements) && a_response_valid_q)
+        $fatal(1, "GeMV carry-only tile unexpectedly received a new A word.");
       if (done_q && (sram_a_re_o || sram_b_re_o || sram_c_we_o ||
                      valid_data || result_valid || output_queue_used_q != '0))
         $fatal(1, "done asserted before all memory/MAC activity drained.");
@@ -604,6 +689,7 @@ module gemm_accelerator_top_mac_array #(
   // and accumulator contexts are accounted for by the unchanged PE modules.
   localparam int unsigned TopRegisterBits = $bits({
     state_q, M_size_q, K_size_q, N_size_q, read_beat_q, controller_done_seen_q, done_q,
+    gemv_a_word_q, gemv_carry_count_q, gemv_a_response_offset_q, gemv_seed_q,
     b_valid_q, b_fetch_bank_q, b_compute_bank_q, b_fetch_done_q, b_fetch_beat_q,
     b_fetch_m_q, b_fetch_n_q, b_fetch_k_q,
     shared_q, a_ready_q, a_head_q, a_tail_q, a_used_q,
@@ -656,6 +742,10 @@ module gemm_accelerator_top_mac_array #(
   `CPAEP_TOP_REGISTER_ENERGY(K_size_q)
   `CPAEP_TOP_REGISTER_ENERGY(N_size_q)
   `CPAEP_TOP_REGISTER_ENERGY(read_beat_q)
+  `CPAEP_TOP_REGISTER_ENERGY(gemv_a_word_q)
+  `CPAEP_TOP_REGISTER_ENERGY(gemv_carry_count_q)
+  `CPAEP_TOP_REGISTER_ENERGY(gemv_a_response_offset_q)
+  `CPAEP_TOP_REGISTER_ENERGY(gemv_seed_q)
   `CPAEP_TOP_REGISTER_ENERGY(controller_done_seen_q)
   `CPAEP_TOP_REGISTER_ENERGY(done_q)
   `CPAEP_TOP_REGISTER_ENERGY(b_fetch_bank_q)

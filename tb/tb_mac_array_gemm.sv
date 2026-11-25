@@ -11,9 +11,11 @@
 // A row-pair stream and two B banks overlap SRAM loading with computation.
 // Fixed A/B/C words are 832/64/128 bits for both GeMM and GeMV.
 // GeMM A has 64 useful bytes plus 40 padding bytes per physical word.
-// GeMV A uses five words per tile; each B vector fragment uses four words.
+// GeMV A tiles form one compact element stream, including logical M/K tails.
+// Only the final A word is padded; each B vector fragment uses four words.
 // C packs four int32 results per word; each GeMM row is padded separately.
-// Compare all six workload metrics against accepted A688/B256/C64, MReuse16.
+// Compare all six workload metrics against the accepted A832/B64/C128 overlap
+// version, before compact GeMV A packing (same mapping and MReuse=64).
 // Exact operand traffic/order, nonzero padding, bank switching and backpressure
 // are checked without changing the independent logical-matrix golden model.
 // Phase 1: one initial reset, then all matrix cases without a DUT reset.
@@ -109,7 +111,7 @@ module tb_mac_array_gemm;
 
  localparam int unsigned NumWorkloads = 6;
 
- localparam int unsigned NumCases     = 53;
+ localparam int unsigned NumCases     = 61;
 
  // Measured in Performance evolution/iteration1.txt, before M-row reuse.
  // This is a comparison reference, not a performance assertion or new run.
@@ -125,13 +127,13 @@ module tb_mac_array_gemm;
  localparam int unsigned PreviousC32Cycles [NumWorkloads] =
    '{2077, 2105, 8129, 17300, 61460, 112660};
  localparam bit HasComparableC32Reference = HasComparableBaseline && (MReuse == 4);
- // Accepted A688/B256/C64, MReuse16 reference from the previous architecture.
+ // Accepted A832/B64/C128 overlap version, before compact GeMV A packing.
  // These are measured comparison values, not expected results or assertions.
- localparam int unsigned PreviousMReuse16Cycles [NumWorkloads] =
-   '{1079, 1173, 4869, 10381, 36877, 67597};
- // Port widths, mapping and reuse intentionally differ; the same six logical
- // workloads and 512 int8/int32 MAC lanes make their latency directly comparable.
- localparam bit HasComparableMReuse16Reference =
+ localparam int unsigned PreviousOverlapCycles [NumWorkloads] =
+   '{582, 646, 2438, 8649, 30729, 56329};
+ // Other parameter choices remain comparable on the same six logical workloads
+ // and 512 int8/int32 MAC lanes; the printed reference states its fixed settings.
+ localparam bit HasComparableOverlapReference =
    (NumCores == 16) && (NumInputs == 32) &&
    (InDataWidth == 8) && (OutDataWidth == 32);
 
@@ -145,12 +147,17 @@ module tb_mac_array_gemm;
    ResetPrefetchPending,
    ResetBPrefetchPending,
    ResetBankSwitch,
-   ResetOutputBackpressure
+   ResetOutputBackpressure,
+   ResetCarryDuringLoad,
+   ResetCarrySeedPending
  } reset_target_t;
 
  localparam int unsigned NumResetTargets = 6;
- localparam int unsigned NumResetCases   = 2 * NumResetTargets + 4;
- // Six targets in each mode, GeMV prefetch, and three GeMM overlap/FIFO targets.
+ localparam bit HasGemvCarry = ((TileElements % AElements) != 0);
+ localparam int unsigned NumResetCases = 2 * NumResetTargets + 4 +
+                                        (HasGemvCarry ? 2 : 0);
+ // Six targets in each mode, GeMV prefetch, three GeMM overlap/FIFO targets,
+ // and two compact-stream carry targets when the word/tile sizes are unaligned.
 
  // Pattern IDs: 0=random, 1=zero, 2=+1, 3=-1, 4=A:-1/B:+1,
  //              5=+127, 6=-128, 7=alternating A / B:+1.
@@ -240,7 +247,27 @@ module tb_mac_array_gemm;
 
    // Nonzero input padding makes missing operand masks visible numerically.
    '{"GeMM poison tails", GemmRows+1, NumInputs+1, GemmCols+1, 0},
-   '{"GeMV poison tails", NumCores+1, NumInputs+1, 1, 0}
+   '{"GeMV poison tails", NumCores+1, NumInputs+1, 1, 0},
+
+   // With A832, 13 x512-byte tiles occupy exactly 64 x104-byte words.
+   // Exercise the short read interval, its following tile, and end-of-job
+   // handling immediately before/on/after that physical alignment boundary.
+   '{"GeMV stream 12", NumCores, 12*NumInputs, 1, 0},
+   '{"GeMV stream 13", NumCores, 13*NumInputs, 1, 0},
+   '{"GeMV stream 14", NumCores, 14*NumInputs, 1, 0},
+
+   // Same alignment period across M groups; every tile produces a C group.
+   '{"GeMV stream M", 14*NumCores, NumInputs, 1, 0},
+
+   // Carry must preserve stream order across both K/M boundaries. Nonzero
+   // padding checks that partial K lanes and partial M rows remain masked.
+   '{"GeMV stream tails", 2*NumCores+1, 5*NumInputs-1, 1, 0},
+
+   // Change the operands at identical SRAM addresses without a DUT reset.
+   // Each job ends with an incomplete physical word, exposing stale carry.
+   '{"GeMV carry first", NumCores+1, 7*NumInputs-1, 1, 0},
+   '{"GeMV carry repeat", NumCores+1, 7*NumInputs-1, 1, 1},
+   '{"GeMV carry changed", NumCores+1, 7*NumInputs-1, 1, 0}
  };
 
  int unsigned     case_cycles [NumCases];
@@ -526,11 +553,13 @@ module tb_mac_array_gemm;
 
    poison_padding = !force_random &&
      ((test_cases[test_id].name == "GeMM poison tails") ||
-      (test_cases[test_id].name == "GeMV poison tails"));
+      (test_cases[test_id].name == "GeMV poison tails") ||
+      (test_cases[test_id].name == "GeMV stream tails"));
 
    if (n_sz == 1) begin
 
-     a_used_words = ((m_sz + NumCores - 1) / NumCores) * k_blocks * AReadWords;
+     a_used_words = (((m_sz + NumCores - 1) / NumCores) * k_blocks *
+                     TileElements + AElements - 1) / AElements;
 
      b_used_words = k_blocks * VectorReadWords;
 
@@ -629,7 +658,7 @@ module tb_mac_array_gemm;
        B_ref[k_sz*n_sz - 1] = (test_id % 2 == 0) ? 8'sh80 : 8'sd127;
    end
 
-   // Normal input padding is zero. Two directed cases instead use nonzero
+   // Normal input padding is zero. Directed cases instead use nonzero
    // padding to check masks independently of the normal SRAM initialization.
    // C is poisoned so unwritten results cannot pass silently.
    for (int unsigned w = 0; w < a_used_words; w++)
@@ -647,11 +676,12 @@ module tb_mac_array_gemm;
 
        if (n_sz == 1) begin
 
-         element = (m % NumCores) * NumInputs + (k % NumInputs);
+         // A is a continuous stream of logical tiles. A physical word may
+         // contain the end of one tile and the beginning of its successor.
+         element = ((m / NumCores) * k_blocks + k / NumInputs) * TileElements +
+                   (m % NumCores) * NumInputs + (k % NumInputs);
 
-         word_addr = ((m / NumCores) * k_blocks + k / NumInputs) * AReadWords +
-
-                     element / AElements;
+         word_addr = element / AElements;
 
          lane = element % AElements;
 
@@ -846,6 +876,14 @@ module tb_mac_array_gemm;
    return (n_sz == 1) ? m_groups*k_blocks : m_groups*n_groups*k_blocks;
  endfunction
 
+ function automatic longint unsigned expected_a_reads(
+   input int unsigned m_sz, k_sz, n_sz
+ );
+   longint unsigned steps;
+   steps = expected_compute_steps(m_sz, k_sz, n_sz);
+   return (n_sz == 1) ? ((steps*TileElements + AElements - 1) / AElements) : steps;
+ endfunction
+
  // Decode the logical issue ordering to check every prefetched A address.
  // Earlier M groups are full; only the final group has fewer row pairs.
  function automatic longint unsigned expected_gemm_a_address(
@@ -942,11 +980,9 @@ module tb_mac_array_gemm;
      num_errors++;
    end
 
-   if (a_reads != expected_compute_steps(M_i, K_i, N_i) *
-                  ((N_i == 1) ? AReadWords : 1)) begin
+   if (a_reads != expected_a_reads(M_i, K_i, N_i)) begin
      $display("ERROR: SRAM A reads=%0d, expected=%0d.",
-              a_reads, expected_compute_steps(M_i, K_i, N_i) *
-                       ((N_i == 1) ? AReadWords : 1));
+              a_reads, expected_a_reads(M_i, K_i, N_i));
      num_errors++;
    end
 
@@ -976,6 +1012,8 @@ module tb_mac_array_gemm;
      ResetBPrefetchPending:return "B prefetch overlapping computation";
      ResetBankSwitch:      return "first issue after B bank switch";
      ResetOutputBackpressure:return "C FIFO backpressure";
+     ResetCarryDuringLoad: return "nonzero GeMV carry during operand load";
+     ResetCarrySeedPending:return "GeMV carry seed pending after accepted issue";
      default:             return "unknown reset target";
    endcase
  endfunction
@@ -1019,6 +1057,19 @@ module tb_mac_array_gemm;
               seen_gemm_issue && (i_dut.b_compute_bank_q != previous_b_bank);
      ResetOutputBackpressure:
        return (i_dut.is_gemv === 1'b0) && (i_dut.output_stall === 1'b1);
+     ResetCarryDuringLoad:
+       return (i_dut.is_gemv === 1'b1) &&
+              (i_dut.state_q === i_dut.TopLoad) &&
+              (i_dut.gemv_carry_count_q != '0) && (mac_compute_cycles > 0);
+     ResetCarrySeedPending:
+       // A832/512-byte tiles reach the largest carry (96 bytes) after tile12,
+       // immediately before the four-read tile. Other sizes use any live carry.
+       return (i_dut.is_gemv === 1'b1) &&
+              (i_dut.gemv_seed_q === 1'b1) && (i_dut.valid_data === 1'b1) &&
+              (i_dut.gemv_carry_count_q != '0) &&
+              (((AElements != 104) || (TileElements != 512)) ||
+               ((i_dut.gemv_carry_count_q == 96) &&
+                (i_dut.a_response_valid_q === 1'b1)));
      default: return 1'b0;
    endcase
  endfunction
@@ -1037,6 +1088,7 @@ module tb_mac_array_gemm;
    if ({i_dut.valid_data, i_dut.init_save, i_dut.result_valid,
         i_dut.controller_busy, i_dut.controller_done,
         i_dut.controller_done_seen_q,
+        i_dut.gemv_carry_count_q, i_dut.gemv_seed_q,
         i_dut.a_response_valid_q, i_dut.b_response_valid_q,
         i_dut.b_valid_q, i_dut.a_ready_q, i_dut.a_used_q,
         i_dut.a_fetch_done_q, i_dut.b_fetch_done_q, i_dut.output_slot_busy_q,
@@ -1083,6 +1135,7 @@ module tb_mac_array_gemm;
      abort_n = 4 * GemmCols;
    end
    if (target == ResetOutputBackpressure) abort_k = NumInputs;
+   if (target == ResetCarrySeedPending) abort_k = 14 * NumInputs;
 
    M_i = SizeAddrWidth'(abort_m);
    K_i = SizeAddrWidth'(abort_k);
@@ -1204,6 +1257,12 @@ module tb_mac_array_gemm;
    run_reset_case(ResetBPrefetchPending, 1'b0);
    run_reset_case(ResetBankSwitch, 1'b0);
    run_reset_case(ResetOutputBackpressure, 1'b0);
+   if (HasGemvCarry) begin
+     run_reset_case(ResetCarryDuringLoad, 1'b1);
+     run_reset_case(ResetCarrySeedPending, 1'b1);
+   end else begin
+     $display("Carry reset targets are not applicable: the A word divides a logical GeMV tile exactly.");
+   end
  endtask
 
  //---------------------------
@@ -1271,7 +1330,7 @@ module tb_mac_array_gemm;
 
                      active_case_name, sram_a_addr, a_used_words);
 
-         // GeMV A tiles occupy consecutive complete words. Check the order
+         // The compact GeMV A stream reads every word exactly once. Check order
          // independently of DUT counters, including prefetched words.
          if ((N_i == 1) && (longint'(sram_a_addr) != a_reads))
            $fatal(1, "[%0s] GeMV A read %0d: address=%0d, expected=%0d.",
@@ -1407,6 +1466,8 @@ module tb_mac_array_gemm;
             GemmRows, GemmCols, NumInputs, MReuse, NumContexts);
    $display("Fixed SRAM widths A/B/C=%0d/%0d/%0d bits for every workload.",
             SramADataWidth, SramBDataWidth, SramCDataWidth);
+   $display("GeMV A packing: continuous %0d-element tiles; one physical word may span two tiles.",
+            TileElements);
    $display("C packing: %0d int32 results/word; GeMM row padding and GeMV final padding are zero.",
             CElements);
    $display("PHASE 1: %0d matrix cases without an intermediate DUT reset.", NumCases);
@@ -1610,18 +1671,18 @@ module tb_mac_array_gemm;
  // Compare all five requested metrics for each of the six required workloads.
  // The saved reference uses all 512 lanes on every accepted compute cycle,
  // so its spatial utilization is 100% and temporal equals total utilization.
- task automatic print_mreuse16_comparison();
+ task automatic print_overlap_comparison();
    real operations, reference_normalized, current_normalized, reference_util;
    real reference_normalized_sum, current_normalized_sum, reference_util_sum;
    real current_spatial_sum, current_temporal_sum, current_total_sum;
 
-   if (!HasComparableMReuse16Reference) begin
-     $display(" A688/MReuse16 comparison omitted: arithmetic or array size differs from the 512-MAC reference.");
+   if (!HasComparableOverlapReference) begin
+     $display(" A832 overlap comparison omitted: arithmetic or array size differs from the 512-MAC reference.");
      return;
    end
    for (int unsigned c = 0; c < NumWorkloads; c++) begin
      if (case_errors[c] != 0) begin
-       $display(" A688/MReuse16 comparison INVALID: a required workload failed.");
+       $display(" A832 overlap comparison INVALID: a required workload failed.");
        return;
      end
    end
@@ -1633,18 +1694,18 @@ module tb_mac_array_gemm;
    current_temporal_sum = 0.0;
    current_total_sum = 0.0;
 
-   $display("\n COMPARISON -- saved A688/B256/C64 MReuse16 reference versus current mapping");
-   $display(" Reference: A/B/C=688/256/64 bits, MReuse=16 rows, 1 M x16 N x32 K, GeMV prefetch.");
+   $display("\n COMPARISON -- saved A832 overlap reference versus compact GeMV A stream");
+   $display(" Reference: A/B/C=832/64/128 bits, MReuse=64 rows, 2 M x8 N x32 K; GeMV A padded per tile.");
    $display(" %s | %10s | %10s | %16s | %16s",
             pad("Case", 14), "Cycles ref", "Cycles now", "Cycles/MKN ref", "Cycles/MKN now");
    for (int unsigned c = 0; c < NumWorkloads; c++) begin
      operations = real'(test_cases[c].M) * real'(test_cases[c].K) * real'(test_cases[c].N);
-     reference_normalized = real'(PreviousMReuse16Cycles[c]) / operations;
+     reference_normalized = real'(PreviousOverlapCycles[c]) / operations;
      current_normalized = real'(case_cycles[c]) / operations;
      reference_normalized_sum += reference_normalized;
      current_normalized_sum += current_normalized;
      $display(" %s | %10d | %10d | %16.9f | %16.9f",
-              pad(test_cases[c].name, 14), PreviousMReuse16Cycles[c], case_cycles[c],
+              pad(test_cases[c].name, 14), PreviousOverlapCycles[c], case_cycles[c],
               reference_normalized, current_normalized);
    end
 
@@ -1652,7 +1713,7 @@ module tb_mac_array_gemm;
             pad("Case", 14), "Spatial ref", "Spatial now", "Temp. ref", "Temp. now", "Total ref", "Total now");
    for (int unsigned c = 0; c < NumWorkloads; c++) begin
      operations = real'(test_cases[c].M) * real'(test_cases[c].K) * real'(test_cases[c].N);
-     reference_util = 100.0 * operations / (512.0 * real'(PreviousMReuse16Cycles[c]));
+     reference_util = 100.0 * operations / (512.0 * real'(PreviousOverlapCycles[c]));
      reference_util_sum += reference_util;
      current_spatial_sum += case_spatial_util[c];
      current_temporal_sum += case_temporal_util[c];
@@ -1665,10 +1726,10 @@ module tb_mac_array_gemm;
             pad("Mean", 14), 100.0, current_spatial_sum / real'(NumWorkloads),
             reference_util_sum / real'(NumWorkloads), current_temporal_sum / real'(NumWorkloads),
             reference_util_sum / real'(NumWorkloads), current_total_sum / real'(NumWorkloads));
-   $display(" A688/MReuse16 mean normalized latency: reference=%.9f, current=%.9f cycles/MAC.",
+   $display(" A832 overlap mean normalized latency: reference=%.9f, current=%.9f cycles/MAC.",
             reference_normalized_sum / real'(NumWorkloads),
             current_normalized_sum / real'(NumWorkloads));
-   $display(" Measured reduction versus saved A688/MReuse16: %0.2f%% (positive is better).",
+   $display(" Measured reduction versus saved A832 overlap: %0.2f%% (positive is better).",
             100.0 * (1.0 - current_normalized_sum / reference_normalized_sum));
  endtask
 
@@ -1768,7 +1829,19 @@ module tb_mac_array_gemm;
 
    end
 
-   print_mreuse16_comparison();
+   print_overlap_comparison();
+
+   $display("\n A-STREAM DIAGNOSTICS -- six required workloads at the current A word width");
+   $display(" %s | %12s | %12s | %12s",
+            pad("Case", 14), "A old layout", "A measured", "A words saved");
+   for (int unsigned c = 0; c < NumWorkloads; c++) begin
+     longint unsigned old_layout_reads;
+     old_layout_reads = expected_compute_steps(test_cases[c].M, test_cases[c].K,
+                                               test_cases[c].N) *
+                        ((test_cases[c].N == 1) ? AReadWords : 1);
+     $display(" %s | %12d | %12d | %12d", pad(test_cases[c].name, 14),
+              old_layout_reads, case_a_reads[c], old_layout_reads - case_a_reads[c]);
+   end
 
    $display("\n REUSE / OUTPUT-BANDWIDTH DIAGNOSTICS -- six required workloads");
    $display(" %s | %10s | %10s | %10s | %10s | %10s",

@@ -6,7 +6,9 @@
 
 // Expanded boundary, data-pattern and functional-coverage regression.
 // Additional random-data runs cover all six required workload dimensions.
-// One reset at startup; all cases then run consecutively without a DUT reset.
+// Phase 1: one initial reset, then all matrix cases without a DUT reset.
+// Phase 2: directed reset/abort/restart tests on the same DUT and SRAMs.
+// Both phases contribute to the same simulation's code coverage.
 
 //-----------------------------------------------------------------------------
 
@@ -81,6 +83,18 @@ module tb_mac_array_gemm;
  localparam int unsigned NumWorkloads = 6;
 
  localparam int unsigned NumCases     = 37;
+
+ typedef enum int unsigned {
+   ResetTopStart,
+   ResetDuringLoad,
+   ResetTopFlush,
+   ResetTopIssue,
+   ResetControllerDrain,
+   ResetDuringCWrite
+ } reset_target_t;
+
+ localparam int unsigned NumResetTargets = 6;
+ localparam int unsigned NumResetCases   = 2 * NumResetTargets; // GeMM and GeMV
 
  // Pattern IDs: 0=random, 1=zero, 2=+1, 3=-1, 4=A:-1/B:+1,
  //              5=+127, 6=-128, 7=alternating A / B:+1.
@@ -192,7 +206,7 @@ module tb_mac_array_gemm;
 
  bit c_written[];
 
- int unsigned active_case;
+ string active_case_name;
 
  int unsigned a_used_words, b_used_words, c_used_words;
 
@@ -201,6 +215,9 @@ module tb_mac_array_gemm;
  longint unsigned mac_compute_cycles;
 
  bit monitor_active, case_finished;
+
+ bit expect_reset_quiet;
+ int unsigned reset_cases_passed;
 
  int unsigned seed_state;
  int unsigned active_pattern;
@@ -387,7 +404,9 @@ module tb_mac_array_gemm;
 
    input int unsigned k_sz,
 
-   input int unsigned n_sz
+   input int unsigned n_sz,
+
+   input bit force_random = 1'b0
 
  );
 
@@ -457,7 +476,7 @@ module tb_mac_array_gemm;
 
 
    // The case table selects the pattern explicitly, independent of its index.
-   active_pattern = test_cases[test_id].pattern;
+   active_pattern = force_random ? 0 : test_cases[test_id].pattern;
 
    foreach (A_ref[i]) begin
      case (active_pattern)
@@ -693,7 +712,7 @@ module tb_mac_array_gemm;
 
      if (elapsed_cycles > max_cycles)
 
-       $fatal(1, "[%0s] Timeout after %0d cycles.", test_cases[active_case].name, elapsed_cycles);
+       $fatal(1, "[%0s] Timeout after %0d cycles.", active_case_name, elapsed_cycles);
 
    end
 
@@ -743,6 +762,218 @@ module tb_mac_array_gemm;
 
  //---------------------------
 
+ // Directed reset tests, run AFTER the normal matrix regression.
+ // The target states are observed, never forced. Reset is driven on a negedge.
+ //---------------------------
+
+ function automatic string reset_target_name(input reset_target_t target);
+   case (target)
+     ResetTopStart:        return "TopStart";
+     ResetDuringLoad:      return "mid-load after first K block";
+     ResetTopFlush:        return "TopFlush";
+     ResetTopIssue:        return "TopIssue of second K block";
+     ResetControllerDrain: return "ControllerDrain";
+     ResetDuringCWrite:    return "partial C write in TopDrain";
+     default:             return "unknown reset target";
+   endcase
+ endfunction
+
+ function automatic bit reset_target_reached(input reset_target_t target);
+   case (target)
+     ResetTopStart:
+       return (i_dut.state_q === i_dut.TopStart);
+     ResetDuringLoad:
+       return (i_dut.state_q === i_dut.TopLoad) &&
+              (i_dut.K_count == NumInputs) &&
+              (i_dut.read_beat_q != '0) && (mac_compute_cycles > 0);
+     ResetTopFlush:
+       return (i_dut.state_q === i_dut.TopFlush);
+     ResetTopIssue:
+       return (i_dut.state_q === i_dut.TopIssue) &&
+              (i_dut.K_count == NumInputs) && (mac_compute_cycles > 0);
+     ResetControllerDrain:
+       return (i_dut.state_q === i_dut.TopDrain) &&
+              (i_dut.i_gemm_controller_mac_array.current_state ===
+               i_dut.i_gemm_controller_mac_array.ControllerDrain);
+     ResetDuringCWrite:
+       return (i_dut.state_q === i_dut.TopDrain) &&
+              (sram_c_we === 1'b1) && (i_dut.c_core_q != '0) &&
+              (c_writes > 0) && (c_writes < c_used_words);
+     default: return 1'b0;
+   endcase
+ endfunction
+
+ task automatic check_reset_idle(input string phase_label);
+   if ({sram_a_re, sram_b_re, sram_c_we, done} !== 4'b0000)
+     $fatal(1, "[%0s] Nonzero/unknown memory control or done during %0s.",
+            active_case_name, phase_label);
+
+   if ((i_dut.state_q !== i_dut.TopIdle) ||
+       (i_dut.i_gemm_controller_mac_array.current_state !==
+        i_dut.i_gemm_controller_mac_array.ControllerIdle))
+     $fatal(1, "[%0s] FSM did not return to idle during %0s.",
+            active_case_name, phase_label);
+
+   if ({i_dut.valid_data, i_dut.init_save, i_dut.result_valid,
+        i_dut.controller_busy, i_dut.controller_done,
+        i_dut.controller_done_seen_q,
+        i_dut.a_response_valid_q, i_dut.b_response_valid_q,
+        i_dut.a_cache_valid_q, i_dut.output_slot_busy_q,
+        i_dut.c_valid_q} !== '0)
+     $fatal(1, "[%0s] Stale valid/busy/cache state during %0s.",
+            active_case_name, phase_label);
+
+   if ({i_dut.M_count, i_dut.K_count, i_dut.N_count} !== '0)
+     $fatal(1, "[%0s] Block counters not cleared during %0s.",
+            active_case_name, phase_label);
+
+   if (i_dut.array_c_out !== '0)
+     $fatal(1, "[%0s] MAC accumulators not cleared during %0s.",
+            active_case_name, phase_label);
+ endtask
+
+ task automatic run_reset_case(
+   input reset_target_t target,
+   input bit abort_is_gemv
+ );
+   int unsigned abort_m, abort_k, abort_n;
+   int unsigned recovery_m, recovery_k, recovery_n;
+   int unsigned waited_cycles, max_cycles;
+   int unsigned recovery_cycles, recovery_errors;
+   real recovery_energy;
+   string reset_label;
+   logic signed [OutDataWidth-1:0] c_snapshot[];
+
+   reset_label = $sformatf("%0s / %0s",
+                         abort_is_gemv ? "GeMV" : "GeMM",
+                         reset_target_name(target));
+   active_case_name = {reset_label, " abort"};
+
+   // Two K blocks and more than one output tile exercise live accumulators,
+   // buffers, response tags and the serialized C output before cancellation.
+   abort_m = abort_is_gemv ? (2 * NumCores) : 2;
+   abort_k = 2 * NumInputs;
+   abort_n = abort_is_gemv ? 1 : (2 * NumCores);
+
+   M_i = SizeAddrWidth'(abort_m);
+   K_i = SizeAddrWidth'(abort_k);
+   N_i = SizeAddrWidth'(abort_n);
+   initialize_memories(0, abort_m, abort_k, abort_n, 1'b1);
+   max_cycles = timeout_cycles(abort_m, abort_k, abort_n);
+   waited_cycles = 0;
+
+   $display("\n[RESET %0s] Start abort job M=%0d K=%0d N=%0d.",
+            reset_label, abort_m, abort_k, abort_n);
+
+   @(negedge clk_i);
+   if (done !== 1'b0) $fatal(1, "[%0s] done high before abort job.", active_case_name);
+   monitor_active = 1'b1;
+   case_finished = 1'b0;
+   start = 1'b1;
+
+   @(negedge clk_i);
+   start = 1'b0;
+
+   // Check this very negedge too: TopStart lasts only one cycle.
+   while (!reset_target_reached(target)) begin
+     if (done !== 1'b0)
+       $fatal(1, "[%0s] Job completed before reset target was reached.", active_case_name);
+     if (waited_cycles >= max_cycles)
+       $fatal(1, "[%0s] Timeout waiting for reset target.", active_case_name);
+     @(negedge clk_i);
+     waited_cycles++;
+   end
+   if (done !== 1'b0)
+     $fatal(1, "[%0s] Reset target was reached after job completion.", active_case_name);
+
+   // Four-state snapshot: preserve both written data and unwritten X words.
+   // Take it before reset; do not refill C until reset/idle checking is done.
+   c_snapshot = new[DataDepthC];
+   for (int unsigned w = 0; w < DataDepthC; w++)
+     c_snapshot[w] = i_sram_c.memory[w];
+
+   $display("[RESET %0s] Assert reset after %0d compute cycles and %0d C writes.",
+            reset_label, mac_compute_cycles, c_writes);
+   rst_ni = 1'b0;
+   monitor_active = 1'b0; // This job is intentionally aborted; no done is expected.
+   case_finished = 1'b0;
+   #1; // Allow asynchronous reset NBAs and combinational outputs to settle.
+   expect_reset_quiet = 1'b1;
+   check_reset_idle("reset assertion");
+
+   repeat (2) begin
+     @(posedge clk_i);
+     #1;
+     check_reset_idle("reset hold");
+   end
+
+   @(negedge clk_i);
+   rst_ni = 1'b1;
+   #1;
+   check_reset_idle("reset release");
+
+   // Longer than the result pipeline plus one full C serialization burst.
+   repeat (NumCores + 4) begin
+     @(posedge clk_i);
+     #1;
+     check_reset_idle("idle after reset");
+   end
+
+   for (int unsigned w = 0; w < DataDepthC; w++) begin
+     if (i_sram_c.memory[w] !== c_snapshot[w])
+       $fatal(1, "[%0s] C[%0d] changed during reset/idle: before=%h after=%h.",
+              active_case_name, w, c_snapshot[w], i_sram_c.memory[w]);
+   end
+
+   // Fresh random data, opposite mode and partial tiles after EVERY reset.
+   // Local measurements never overwrite the 37 matrix-case score arrays.
+   recovery_m = abort_is_gemv ? 3 : (NumCores + 1);
+   recovery_k = NumInputs + 1;
+   recovery_n = abort_is_gemv ? (NumCores + 1) : 1;
+   active_case_name = {reset_label, " recovery"};
+   M_i = SizeAddrWidth'(recovery_m);
+   K_i = SizeAddrWidth'(recovery_k);
+   N_i = SizeAddrWidth'(recovery_n);
+   initialize_memories(0, recovery_m, recovery_k, recovery_n, 1'b1);
+   gemm_golden(recovery_m, recovery_k, recovery_n);
+   expect_reset_quiet = 1'b0;
+
+   start_and_wait_gemm(recovery_cycles, recovery_energy,
+                       timeout_cycles(recovery_m, recovery_k, recovery_n));
+   verify_result_c(recovery_errors);
+   if (recovery_errors != 0)
+     $fatal(1, "[%0s] Recovery result failed with %0d errors.",
+            active_case_name, recovery_errors);
+
+   repeat (2) begin
+     clk_delay(1);
+     if (done !== 1'b0)
+       $fatal(1, "[%0s] Recovery done must be a one-cycle pulse.", active_case_name);
+   end
+   monitor_active = 1'b0;
+   case_finished = 1'b0;
+
+   reset_cases_passed++;
+   $display("[RESET %0s] PASS: C preserved and recovery M=%0d K=%0d N=%0d correct (%0d cycles).",
+            reset_label, recovery_m, recovery_k, recovery_n, recovery_cycles);
+ endtask
+
+ task automatic run_reset_tests();
+   if (NumCores < 2 || AReadWords < 2 || BReadWords < 2)
+     $fatal(1, "Reset scenarios require at least two cores and two read beats per A/B tile.");
+
+   $display("\n==========================================");
+   $display(" PHASE 2: RESET / ABORT / RESTART TESTS");
+   $display("==========================================");
+   reset_cases_passed = 0;
+   for (int unsigned mode = 0; mode < 2; mode++) begin
+     for (int unsigned r = 0; r < NumResetTargets; r++) begin
+       run_reset_case(reset_target_t'(r), mode == 1);
+     end
+   end
+ endtask
+
+ //---------------------------
  // Monitor physical SRAM transactions and MAC utilization at rising clock edges.
 
  // Do not sample read data here: it is updated after the edge by the SRAM.
@@ -750,6 +981,13 @@ module tb_mac_array_gemm;
  //---------------------------
 
  always @(posedge clk_i) begin
+
+   // Sample BEFORE NBA updates, including while reset is low: SRAM writes
+   // are clocked and are not internally disabled by rst_ni.
+   if (expect_reset_quiet &&
+       ({sram_a_re, sram_b_re, sram_c_we, done} !== 4'b0000))
+     $fatal(1, "[%0s] Unexpected transaction/done at a reset or idle clock edge.",
+            active_case_name);
 
    if (rst_ni) begin
 
@@ -767,7 +1005,7 @@ module tb_mac_array_gemm;
 
        if (case_finished && (sram_a_re || sram_b_re || sram_c_we))
 
-         $fatal(1, "[%0s] SRAM transaction after done.", test_cases[active_case].name);
+         $fatal(1, "[%0s] SRAM transaction after done.", active_case_name);
 
        // Count cycles in which the DUT actually presents a valid MAC tile.
        // This count is the denominator for spatial utilization and the
@@ -782,7 +1020,7 @@ module tb_mac_array_gemm;
 
            $fatal(1, "[%0s] Invalid A word address %0h (used words=%0d).",
 
-                     test_cases[active_case].name, sram_a_addr, a_used_words);
+                     active_case_name, sram_a_addr, a_used_words);
 
          a_reads++;
 
@@ -794,7 +1032,7 @@ module tb_mac_array_gemm;
 
            $fatal(1, "[%0s] Invalid B word address %0h (used words=%0d).",
 
-                     test_cases[active_case].name, sram_b_addr, b_used_words);
+                     active_case_name, sram_b_addr, b_used_words);
 
          b_reads++;
 
@@ -806,17 +1044,17 @@ module tb_mac_array_gemm;
 
            $fatal(1, "[%0s] Invalid C word address %0h (used words=%0d).",
 
-                     test_cases[active_case].name, sram_c_addr, c_used_words);
+                     active_case_name, sram_c_addr, c_used_words);
 
          if ($isunknown(sram_c_wdata))
 
            $fatal(1, "[%0s] Unknown C write data at address %0d.",
 
-                     test_cases[active_case].name, sram_c_addr);
+                     active_case_name, sram_c_addr);
 
          if (c_written[sram_c_addr])
 
-           $fatal(1, "[%0s] Duplicate write to C[%0d].", test_cases[active_case].name, sram_c_addr);
+           $fatal(1, "[%0s] Duplicate write to C[%0d].", active_case_name, sram_c_addr);
 
          c_written[sram_c_addr] = 1'b1;
 
@@ -860,7 +1098,9 @@ module tb_mac_array_gemm;
 
    case_finished = 1'b0;
 
-   active_case = 0;
+   active_case_name = "startup";
+   expect_reset_quiet = 1'b0;
+   reset_cases_passed = 0;
 
    a_used_words = 0;
 
@@ -881,7 +1121,7 @@ module tb_mac_array_gemm;
 
    void'($urandom(seed_state));
 
-   // The only reset in this simulation. Release it away from a rising edge.
+   // The only reset in phase 1. Release it away from a rising edge.
 
    repeat (5) @(negedge clk_i);
 
@@ -890,10 +1130,11 @@ module tb_mac_array_gemm;
    clk_delay(1);
 
    $display("Random seed: 0x%08h", RandomSeed);
+   $display("PHASE 1: %0d matrix cases without an intermediate DUT reset.", NumCases);
 
    foreach (test_cases[c]) begin
 
-     active_case = c;
+     active_case_name = test_cases[c].name;
 
      M_i = SizeAddrWidth'(test_cases[c].M);
 
@@ -1025,7 +1266,16 @@ module tb_mac_array_gemm;
 
    end
 
+   // Normal-case results are already saved. Reset tests add code coverage
+   // on this SAME DUT instance, without changing the project latency score.
+   // Keep the existing functional covergroup samples confined to phase 1.
+   run_reset_tests();
+
    print_report();
+   if (reset_cases_passed != NumResetCases)
+     $fatal(1, "Only %0d of %0d reset/restart tests completed.",
+            reset_cases_passed, NumResetCases);
+   $display("Reset/restart tests: %0d/%0d PASS.", reset_cases_passed, NumResetCases);
 
    $display("\n==========================================");
    $display(" FUNCTIONAL COVERAGE");
@@ -1039,6 +1289,8 @@ module tb_mac_array_gemm;
    $display("Mode x K cross:   %0.2f%%", coverage.mode_k_cross.get_coverage());
    $display("==========================================");
 
+   $display("All %0d matrix cases and %0d reset/restart tests passed!",
+            NumCases, reset_cases_passed);
    $finish;
 
  end
@@ -1154,7 +1406,7 @@ module tb_mac_array_gemm;
 
    if (num_failed != 0) $fatal(1, "%0d of %0d cases FAILED.", num_failed, NumCases);
 
-   $display("All %0d cases passed!", NumCases);
+   $display("All %0d matrix cases passed!", NumCases);
 
  endtask
 

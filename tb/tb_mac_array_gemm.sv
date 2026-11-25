@@ -39,7 +39,7 @@ module tb_mac_array_gemm;
 
  parameter int unsigned NumInputs      = 32;
 
- parameter int unsigned MReuse         = 8;
+ parameter int unsigned MReuse         = 16;
 
  parameter int unsigned SramADataWidth = 688;
 

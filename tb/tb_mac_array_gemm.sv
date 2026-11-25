@@ -4,6 +4,7 @@
 // Each physical read OR write consumes its complete 128-bit bank word.
 // Phase 1: all matrix jobs, including all six random-data reruns, without reset.
 // Phase 2: directed abort/reset/restart tests on the SAME DUT and memories.
+// Phase 3: post-report bank SRAM port/branch/condition/toggle coverage sweep.
 // Logical row-major golden matrices are independent of the banked layout.
 //-----------------------------------------------------------------------------
 module tb_mac_array_gemm;
@@ -182,6 +183,13 @@ module tb_mac_array_gemm;
   logic [NumBanks-1:0][AddrWidth-1:0] bank_addr;
   logic [NumBanks-1:0] bank_re, bank_we;
   logic [NumBanks-1:0][BankDataWidth-1:0] bank_rdata, bank_wdata;
+
+  // Post-report SRAM coverage exercise signals (kept 0 during Phases 1 & 2)
+  logic                                   sram_tb_override;
+  logic [NumBanks-1:0][AddrWidth-1:0]     tb_bank_addr;
+  logic [NumBanks-1:0]                    tb_bank_re, tb_bank_we;
+  logic [NumBanks-1:0][BankDataWidth-1:0] tb_bank_wdata;
+
   logic signed [InDataWidth-1:0] A_ref[], B_ref[];
   logic signed [OutDataWidth-1:0] G_memory[];
   bit c_written[];
@@ -264,8 +272,11 @@ module tb_mac_array_gemm;
       .DataWidth(BankDataWidth), .DataDepth(DataDepth), .AddrWidth(AddrWidth)
     ) i_sram (
       .clk_i(clk_i), .rst_ni(rst_ni),
-      .mem_addr_i(bank_addr[b]), .mem_re_i(bank_re[b]), .mem_we_i(bank_we[b]),
-      .mem_wr_data_i(bank_wdata[b]), .mem_rd_data_o(bank_rdata[b])
+      .mem_addr_i   (sram_tb_override ? tb_bank_addr[b]  : bank_addr[b]),
+      .mem_re_i     (sram_tb_override ? tb_bank_re[b]    : bank_re[b]),
+      .mem_we_i     (sram_tb_override ? tb_bank_we[b]    : bank_we[b]),
+      .mem_wr_data_i(sram_tb_override ? tb_bank_wdata[b] : bank_wdata[b]),
+      .mem_rd_data_o(bank_rdata[b])
     );
   end
 
@@ -864,6 +875,105 @@ module tb_mac_array_gemm;
     run_reset_case(ResetOutputBackpressure,0);
   endtask
 
+  //---------------------------------------------------------------------------
+  // Phase 3: Post-report SRAM port, branch, condition, and toggle coverage
+  //---------------------------------------------------------------------------
+  task automatic run_sram_coverage_exercise();
+    $display("\n==========================================");
+    $display(" PHASE 3: BANKED SRAM COVERAGE EXERCISE");
+    $display("==========================================");
+
+    @(negedge clk_i);
+    sram_tb_override = 1'b1;
+    for (int b = 0; b < NumBanks; b++) begin
+      tb_bank_addr[b]  = '0;
+      tb_bank_re[b]    = 1'b0;
+      tb_bank_we[b]    = 1'b0;
+      tb_bank_wdata[b] = '0;
+    end
+
+    // 1. Toggle all AddrWidth bits (0 -> '1 -> 0) across all 8 banks
+    @(posedge clk_i); #1;
+    @(negedge clk_i);
+    for (int b = 0; b < NumBanks; b++) tb_bank_addr[b] = '1;
+    @(posedge clk_i); #1;
+    @(negedge clk_i);
+    for (int b = 0; b < NumBanks; b++) tb_bank_addr[b] = '0;
+    @(posedge clk_i); #1;
+
+    // 2. Write, read back, and hold '0, '1, and alternating patterns on all 8 banks
+    for (int unsigned step = 0; step < 4; step++) begin
+      logic [BankDataWidth-1:0] pat;
+      case (step)
+        0: pat = '0;
+        1: pat = '1;
+        2: pat = {BankDataWidth{2'b10}};
+        3: pat = '0;
+      endcase
+
+      // Write cycle (mem_we_i = 1, mem_re_i = 0)
+      @(negedge clk_i);
+      for (int b = 0; b < NumBanks; b++) begin
+        tb_bank_addr[b]  = '0;
+        tb_bank_wdata[b] = pat;
+        tb_bank_we[b]    = 1'b1;
+        tb_bank_re[b]    = 1'b0;
+      end
+      @(posedge clk_i); #1;
+
+      // Read cycle (mem_re_i = 1, mem_we_i = 0)
+      @(negedge clk_i);
+      for (int b = 0; b < NumBanks; b++) begin
+        tb_bank_we[b] = 1'b0;
+        tb_bank_re[b] = 1'b1;
+      end
+      @(posedge clk_i); #1;
+
+      for (int b = 0; b < NumBanks; b++) begin
+        if (bank_rdata[b] !== pat)
+          $fatal(1, "Bank %0d loopback mismatch at step %0d.", b, step);
+      end
+
+      // Hold cycle (mem_re_i = 0, mem_we_i = 0)
+      @(negedge clk_i);
+      for (int b = 0; b < NumBanks; b++) tb_bank_re[b] = 1'b0;
+      @(posedge clk_i); #1;
+    end
+
+    // 3. Simultaneous read + write (mem_we_i = 1, mem_re_i = 1) with all-1s
+    @(negedge clk_i);
+    for (int b = 0; b < NumBanks; b++) begin
+      tb_bank_wdata[b] = '1;
+      tb_bank_we[b]    = 1'b1;
+      tb_bank_re[b]    = 1'b1;
+    end
+    @(posedge clk_i); #1;
+
+    // Read back all-1s so mem_rd_data_o is '1 immediately before reset
+    @(negedge clk_i);
+    for (int b = 0; b < NumBanks; b++) begin
+      tb_bank_we[b] = 1'b0;
+      tb_bank_re[b] = 1'b1;
+    end
+    @(posedge clk_i); #1;
+
+    // 4. Assert reset while bank_rdata == '1 to cover reset branch & 1->0 output toggle
+    @(negedge clk_i);
+    for (int b = 0; b < NumBanks; b++) tb_bank_re[b] = 1'b0;
+    rst_ni = 1'b0;
+    @(posedge clk_i); #1;
+    @(negedge clk_i);
+    rst_ni = 1'b1;
+    @(posedge clk_i); #1;
+
+    // Restore normal DUT ownership
+    @(negedge clk_i);
+    for (int b = 0; b < NumBanks; b++) tb_bank_wdata[b] = '0;
+    sram_tb_override = 1'b0;
+    @(posedge clk_i); #1;
+    $display("[SRAM COV] PASS: all 8 SRAM banks exercised across ports, branches, and toggles.");
+  endtask
+
   function automatic string pad(input string str,input int unsigned width);
     while(str.len()<width) str={str," "};
     return str;
@@ -943,6 +1053,7 @@ module tb_mac_array_gemm;
     if(SizeAddrWidth<12 || VectorCacheElements<32 || VectorCacheElements>=4095)
       $fatal(1,"Regression requires12-bit dimensions and a cache allowing the large-K fallback test.");
     start=0;rst_ni=0;M_i='0;K_i='0;N_i='0;monitor_active=0;case_finished=0;
+    sram_tb_override=0;tb_bank_addr='0;tb_bank_re='0;tb_bank_we='0;tb_bank_wdata='0;
     active_case_name="startup";expect_reset_quiet=0;reset_cases_passed=0;
     queue_observation_active=1;check_queue_update=0;queue_head_wraps=0;queue_tail_wraps=0;queue_full_replacements=0;
     paired_c_writes=0;gemv_c_pause_events=0;bank_direction_switches=0;
@@ -991,6 +1102,7 @@ module tb_mac_array_gemm;
     run_reset_tests();print_report();
     if(reset_cases_passed!=NumResetCases) $fatal(1,"Incomplete reset regression.");
     $display("Reset/restart tests:%0d/%0d PASS.",reset_cases_passed,NumResetCases);
+    run_sram_coverage_exercise();
     $display("\n==========================================\n FUNCTIONAL COVERAGE\n==========================================");
     $display("Covergroup total: %0.2f%%",coverage.get_coverage());
     $display("Mode coverage:    %0.2f%%",coverage.cp_mode.get_coverage());

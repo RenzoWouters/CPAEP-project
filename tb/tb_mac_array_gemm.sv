@@ -43,7 +43,7 @@ module tb_mac_array_gemm;
   localparam int unsigned BElements = 8;
   localparam int unsigned GemmCElements = 2*BankResults;
   localparam int unsigned NumWorkloads = 6;
-  localparam int unsigned NumCases = 75;
+  localparam int unsigned NumCases = 78;
   localparam int unsigned PreviousCycles[NumWorkloads] =
     '{302, 558, 2350, 6971, 24686, 45166};
   localparam real PreviousArea = 3068.09375;
@@ -178,7 +178,16 @@ module tb_mac_array_gemm;
    '{"GeMV ctx above", GemvReuseRows+1, GemvFragmentElements+1, 1, 0},
    '{"GeMV ctx cache", GemvReuseRows+1, GemvFragmentElements, 1, 0},
    '{"GeMV ctx multi", 2*GemvReuseRows+1, NumInputs+1, 1, 0},
-   '{"GeMV ctx changed", GemvReuseRows+1, GemvFragmentElements+1, 1, 7}
+   '{"GeMV ctx changed", GemvReuseRows+1, GemvFragmentElements+1, 1, 7},
+
+   // Directed coverage cases from iteration 15. Append them so the previous
+   // cases, random-data sequence and six-workload performance score stay intact.
+   // Complete the full job: a short final M group can wait for B while C is full.
+   '{"GeMM Cfull Bwait", 65, 32, 128, 0},
+   // High N bits and C addresses, with seven valid columns in the final N tile.
+   '{"GeMM high N Caddr", 129, 1, 4095, 0},
+   // ceil(N/8)=511 complements the 512-word C-row stride of the previous case.
+   '{"GeMM Cstride511", 2, 1, 4088, 0}
  };
 
   int unsigned case_cycles[NumCases], case_errors[NumCases];

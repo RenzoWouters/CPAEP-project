@@ -1,2 +1,2 @@
-var g_data = {"6":["work.ceiling_counter",92.25,1],"4":["work.gemm_accelerator_top_mac_array",92.17,1],"5":["work.gemm_controller_mac_array",78.44,1],"7":["work.mac_array",100.00,1],"8":["work.mac_pe_context",87.50,1],"3":["work.single_port_memory",100.00,1],"2":["work.tb_mac_array_gemm",72.91,1]};
+var g_data = {"6":["work.ceiling_counter",95.48,1],"4":["work.gemm_accelerator_top_mac_array",93.38,1],"5":["work.gemm_controller_mac_array",79.66,1],"7":["work.mac_array",100.00,1],"8":["work.mac_pe_context",87.50,1],"3":["work.single_port_memory",100.00,1],"2":["work.tb_mac_array_gemm",73.48,1]};
 processDuLinks(g_data);

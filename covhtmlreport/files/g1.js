@@ -1,2 +1,2 @@
-var g_data = {"9":{"pr":"/tb_mac_array_gemm","ty":2,"dui":2,"dun":"work.tb_mac_array_gemm","cvgs":[{"h":["\\/tb_mac_array_gemm/coverage ",2,1,25,18],"sc":[2,281],"cov":[42,42,100.00],"opts":{"goal":"100"}},{"h":["/tb_mac_array_gemm/gemm_coverage",1,1,18],"sc":[2,234],"cov":[42,42,100.00],"opts":{"goal":"100"}}]}};
+var g_data = {"9":{"pr":"/tb_mac_array_gemm","ty":2,"dui":2,"dun":"work.tb_mac_array_gemm","cvgs":[{"h":["\\/tb_mac_array_gemm/coverage ",2,1,25,18],"sc":[2,290],"cov":[42,42,100.00],"opts":{"goal":"100"}},{"h":["/tb_mac_array_gemm/gemm_coverage",1,1,18],"sc":[2,243],"cov":[42,42,100.00],"opts":{"goal":"100"}}]}};
 processCovergroupsData(g_data);

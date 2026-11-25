@@ -43,7 +43,7 @@ module tb_mac_array_gemm;
   localparam int unsigned BElements = 8;
   localparam int unsigned GemmCElements = 2*BankResults;
   localparam int unsigned NumWorkloads = 6;
-  localparam int unsigned NumCases = 78;
+  localparam int unsigned NumCases = 81;
   localparam int unsigned PreviousCycles[NumWorkloads] =
     '{302, 558, 2350, 6971, 24686, 45166};
   localparam real PreviousArea = 3068.09375;
@@ -187,7 +187,16 @@ module tb_mac_array_gemm;
    // High N bits and C addresses, with seven valid columns in the final N tile.
    '{"GeMM high N Caddr", 129, 1, 4095, 0},
    // ceil(N/8)=511 complements the 512-word C-row stride of the previous case.
-   '{"GeMM Cstride511", 2, 1, 4088, 0}
+   '{"GeMM Cstride511", 2, 1, 4088, 0},
+
+   // Remaining dimension/address gaps after iteration 16. Keep all earlier
+   // cases in their original order; these jobs also use fresh random operands.
+   // Cross A-address bit 16 and high K bits; the last K block has 31 lanes.
+   '{"GeMM high K Aaddr", 1025, 4095, 2, 0},
+   // Exercise the high M bits in the GeMM producers, including the final tail.
+   '{"GeMM high M", 4095, 1, 7, 0},
+   // 4032/64=63 M groups sets complementary ceiling bits; N has six columns.
+   '{"GeMM Mgroups63", 4032, 1, 6, 0}
  };
 
   int unsigned case_cycles[NumCases], case_errors[NumCases];

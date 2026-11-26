@@ -1,0 +1,7 @@
+schema_version,workload,M,K,N,cycles,compute_cycles,a_read_words,b_read_words,c_write_words,num_macs,num_banks,bank_word_bits,peak_bandwidth_bits_per_cycle,m_reuse,gemm_rows,gemv_fragment_elements,output_queue_depth,status
+1,"GeMM 1",64,64,32,302,256,1024,128,512,512,8,128,1024,64,2,128,20,PASS
+1,"GeMM 2",64,128,32,558,512,2048,256,512,512,8,128,1024,64,2,128,20,PASS
+1,"GeMM 3",64,576,32,2350,2304,9216,1152,512,512,8,128,1024,64,2,128,20,PASS
+1,"GeMV 1",1536,576,1,6981,1728,55296,108,384,512,8,128,1024,64,2,128,20,PASS
+1,"GeMV 2",3072,1024,1,24726,6144,196608,384,768,512,8,128,1024,64,2,128,20,PASS
+1,"GeMV 3",2816,2048,1,45246,11264,360448,768,704,512,8,128,1024,64,2,128,20,PASS

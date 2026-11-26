@@ -201,6 +201,7 @@ module tb_mac_array_gemm;
   real case_energy[NumCases], case_sram_energy[NumCases];
   real case_spatial_util[NumCases], case_temporal_util[NumCases], case_total_util[NumCases];
   longint unsigned case_a_reads[NumCases], case_b_reads[NumCases], case_c_writes[NumCases];
+  longint unsigned case_compute_cycles[NumCases];
   longint unsigned case_output_stalls[NumCases], case_write_cycles[NumCases];
   int unsigned case_queue_peak[NumCases];
   longint unsigned case_b_overlap_cycles[NumCases], case_b_bank_switches[NumCases];
@@ -223,6 +224,7 @@ module tb_mac_array_gemm;
   logic signed [OutDataWidth-1:0] G_memory[];
   bit c_written[];
   string active_case_name;
+  string roofline_csv_path;
   int unsigned a_region_rows, b_region_rows, c_region_rows, b_base, c_base;
   int unsigned a_used_words, b_used_words, c_used_words;
   longint unsigned a_reads, b_reads, c_writes, mac_compute_cycles;
@@ -1112,6 +1114,48 @@ module tb_mac_array_gemm;
     return str;
   endfunction
 
+  // Invalidate an older export at startup. Aborted tests leave an empty CSV.
+  // Relative paths are resolved from the simulator's working directory.
+  task automatic prepare_roofline_csv();
+    int csv_fd;
+    roofline_csv_path = "roofline_results.csv";
+    void'($value$plusargs("ROOFLINE_CSV=%s", roofline_csv_path));
+    csv_fd = $fopen(roofline_csv_path, "w");
+    if (csv_fd == 0)
+      $fatal(1, "Cannot create roofline CSV '%0s'.", roofline_csv_path);
+    $fclose(csv_fd);
+  endtask
+
+  // Raw measurements only: Python derives AI, throughput and utilization.
+  // Counts are individual physical bank words, including unused word lanes.
+  task automatic export_roofline_csv();
+    int csv_fd, file_error;
+    string error_text;
+    csv_fd = $fopen(roofline_csv_path, "w");
+    if (csv_fd == 0)
+      $fatal(1, "Cannot write roofline CSV '%0s'.", roofline_csv_path);
+    $fdisplay(csv_fd, "%s", {"schema_version,workload,M,K,N,cycles,compute_cycles,",
+                      "a_read_words,b_read_words,c_write_words,num_macs,",
+                      "num_banks,bank_word_bits,peak_bandwidth_bits_per_cycle,",
+                      "m_reuse,gemm_rows,gemv_fragment_elements,output_queue_depth,status"});
+    for (int c = 0; c < NumWorkloads; c++) begin
+      $fdisplay(csv_fd, "%0d,\"%s\",%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%s",
+                1, test_cases[c].name,
+                test_cases[c].M, test_cases[c].K, test_cases[c].N,
+                case_cycles[c], case_compute_cycles[c],
+                case_a_reads[c], case_b_reads[c], case_c_writes[c],
+                NumCores*NumInputs, NumBanks, BankDataWidth, NumBanks*BankDataWidth,
+                MReuse, GemmRows, GemvFragmentElements, OutputQueueDepth,
+                (case_errors[c] == 0) ? "PASS" : "FAIL");
+    end
+    $fflush(csv_fd);
+    file_error = $ferror(csv_fd, error_text);
+    $fclose(csv_fd);
+    if (file_error != 0)
+      $fatal(1, "Error writing roofline CSV '%0s': %0s", roofline_csv_path, error_text);
+    $display("Roofline CSV saved: %0s", roofline_csv_path);
+  endtask
+
   task automatic print_report();
     int unsigned num_failed,workload_failures;
     real normalized,norm_sum,spatial_sum,temporal_sum,total_sum;
@@ -1151,6 +1195,7 @@ module tb_mac_array_gemm;
     clk_i=0; forever #5 clk_i=~clk_i;
   end
   initial begin : regression
+    prepare_roofline_csv();
     if(NumBanks!=8 || BankDataWidth!=128 || NumCores!=16 || NumInputs!=32 || GemmRows!=2)
       $fatal(1,"This banked regression uses8x128bit banks and a2Mx8Nx32K mapping.");
     if(SizeAddrWidth<12 || GemvFragmentElements!=BusBytes || 2*GemvReuseRows+1>=4096)
@@ -1180,6 +1225,7 @@ module tb_mac_array_gemm;
       gemm_golden(test_cases[c].M,test_cases[c].K,test_cases[c].N);clk_delay(1);
       start_and_wait_gemm(case_cycles[c],case_energy[c],timeout_cycles(test_cases[c].M,test_cases[c].K,test_cases[c].N));
       case_a_reads[c]=a_reads;case_b_reads[c]=b_reads;case_c_writes[c]=c_writes;
+      case_compute_cycles[c]=mac_compute_cycles;
       case_output_stalls[c]=output_stall_cycles;case_queue_peak[c]=output_queue_peak;case_write_cycles[c]=c_write_cycles;
       case_b_overlap_cycles[c]=b_overlap_cycles;case_b_bank_switches[c]=b_bank_switches;
       case_sram_energy[c]=2.0*real'(BankDataWidth)*(real'(a_reads)+real'(b_reads)+real'(c_writes));
@@ -1204,6 +1250,7 @@ module tb_mac_array_gemm;
     if(reset_cases_passed!=NumResetCases) $fatal(1,"Incomplete reset regression.");
     run_sram_coverage_exercise();
     print_report();
+    export_roofline_csv();
     $display("All %0d matrix cases and %0d reset/restart tests passed!",NumCases,reset_cases_passed);
     $finish;
   end

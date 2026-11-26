@@ -274,7 +274,7 @@ module tb_gemm_controller_mac_array;
     end
 
     if ((request_index != expected_steps) || (result_cycles != m_steps * n_steps))
-      $fatal(1, "Test %0d: counts are reads=%0d/%0d, results=%0d/%0d",
+      $fatal(1, "Test %0d: controller requests=%0d (expected %0d), result groups=%0d (expected %0d)",
              test_id, request_index, expected_steps, result_cycles, m_steps*n_steps);
     if ((stall_cycles != 0) && !stall_started)
       $fatal(1, "Test %0d: directed stall was not exercised", test_id);
@@ -292,8 +292,6 @@ module tb_gemm_controller_mac_array;
     check_idle("second idle cycle");
 
     passed_cases++;
-    $display("PASS test %0d: M/K/N=%0d/%0d/%0d, reads=%0d, result cycles=%0d, clocks=%0d",
-             test_id, m_sz, k_sz, n_sz, request_index, result_cycles, cycle+1);
   endtask
 
   //---------------------------
@@ -396,8 +394,8 @@ module tb_gemm_controller_mac_array;
     run_case(49, GemvGroupRows+1, 2*NumInputs, 1, 0, 2*NumContexts, 3);
     run_case(50, GemvGroupRows+1, NumInputs, 1);
 
-    $display("GLOBAL PASS: all %0d controller cases passed (MReuse=%0d M rows, GemmRows=%0d, contexts=%0d).",
-             passed_cases, MReuse, GemmRows, NumContexts);
+    $display("Controller Testbench completed.");
+    $display("All %0d controller tests passed!", passed_cases);
     $finish;
   end
 endmodule

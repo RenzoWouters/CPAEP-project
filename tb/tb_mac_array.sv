@@ -83,7 +83,8 @@ module tb_mac_array;
   task automatic context_block(
     input int unsigned context_id,
     input bit first_block,
-    input int unsigned step_id
+    input int unsigned step_id,
+    input string test_phase
   );
     @(negedge clk_i);
     acc_context_i = ContextWidth'(context_id);
@@ -106,9 +107,10 @@ module tb_mac_array;
     #1;
     for (int p = 0; p < NumCores; p++) begin
       if (c_o[p] !== context_golden[context_id][p])
-        $fatal(1, "Context %0d, step %0d, core %0d: got %0d, expected %0d",
-               context_id, step_id, p, $signed(c_o[p]),
-               $signed(context_golden[context_id][p]));
+        $fatal(1, "FAIL %s: context %0d, pattern %0d, init_save=%b, core %0d at %0t: got %0d (0x%h), expected %0d (0x%h)",
+               test_phase, context_id, step_id, first_block, p, $time,
+               $signed(c_o[p]), c_o[p],
+               $signed(context_golden[context_id][p]), context_golden[context_id][p]);
     end
   endtask
 
@@ -164,12 +166,11 @@ module tb_mac_array;
 
       for (int p = 0; p < NumCores; p++) begin
         if (golden_c_o[p] !== c_o[p]) begin
-          $display("Error in single-cycle test %0d, core %0d", t, p);
-          $display("OUT: %0d, GOLDEN: %0d", $signed(c_o[p]), $signed(golden_c_o[p]));
-          $fatal;
+          $fatal(1, "FAIL single-cycle test %0d, core %0d, context %0d at %0t: got %0d (0x%h), expected %0d (0x%h)",
+                 t + 1, p, acc_context_i, $time,
+                 $signed(c_o[p]), c_o[p], $signed(golden_c_o[p]), golden_c_o[p]);
         end
       end
-      $display("Single-cycle test %0d passed (all %0d cores).", t, NumCores);
     end
 
     // Deel 2: Multi-step accumulatie langs K (KSteps x 32 elementen)
@@ -205,13 +206,11 @@ module tb_mac_array;
 
       for (int p = 0; p < NumCores; p++) begin
         if (golden_c_o[p] !== c_o[p]) begin
-          $display("Error in multi-step test %0d, core %0d", t, p);
-          $display("OUT: %0d, GOLDEN: %0d", $signed(c_o[p]), $signed(golden_c_o[p]));
-          $fatal;
+          $fatal(1, "FAIL multi-step test %0d (%0d K steps x %0d inputs), core %0d, context %0d at %0t: got %0d (0x%h), expected %0d (0x%h)",
+                 t + 1, KSteps, NumInputs, p, acc_context_i, $time,
+                 $signed(c_o[p]), c_o[p], $signed(golden_c_o[p]), golden_c_o[p]);
         end
       end
-      $display("Multi-step (%0d x %0d) test %0d passed (all %0d cores).",
-               KSteps, NumInputs, t, NumCores);
     end
 
     // Interleave rows, reversing their order on alternate K blocks. The output
@@ -219,7 +218,7 @@ module tb_mac_array;
     for (int step = 0; step < KSteps; step++) begin
       for (int row = 0; row < NumContexts; row++) begin
         context_block((step % 2 == 0) ? row : NumContexts-1-row,
-                      step == 0, step);
+                      step == 0, step, "interleaved context accumulation");
       end
     end
 
@@ -231,9 +230,12 @@ module tb_mac_array;
     acc_context_i = ContextWidth'((int'(acc_context_i)+1) % NumContexts);
     #1;
     if (c_o !== held_result)
-      $fatal(1, "Changing the input context changed the last completed result.");
+      $fatal(1, "FAIL context-selector hold at %0t: selecting context %0d changed the last completed result; got=0x%h, expected=0x%h",
+             $time, acc_context_i, c_o, held_result);
     clk_delay(1);
-    if (c_o !== held_result) $fatal(1, "Invalid block changed an accumulator.");
+    if (c_o !== held_result)
+      $fatal(1, "FAIL invalid-input hold at %0t: a_valid=%b, b_valid=%b, context=%0d; got=0x%h, expected=0x%h",
+             $time, a_valid_i, b_valid_i, acc_context_i, c_o, held_result);
 
     // Each mismatched valid combination must also hold all accumulated data.
     for (int which = 0; which < 2; which++) begin
@@ -241,7 +243,9 @@ module tb_mac_array;
       a_valid_i = (which == 0);
       b_valid_i = (which == 1);
       clk_delay(1);
-      if (c_o !== held_result) $fatal(1, "Mismatched valid inputs changed a result.");
+      if (c_o !== held_result)
+        $fatal(1, "FAIL mismatched-valid test %0d at %0t: a_valid=%b, b_valid=%b, context=%0d; got=0x%h, expected=0x%h",
+               which + 1, $time, a_valid_i, b_valid_i, acc_context_i, c_o, held_result);
     end
 
     // Clear every context and prove it by accumulating without init_save.
@@ -250,13 +254,17 @@ module tb_mac_array;
     b_valid_i = 1'b0;
     acc_clr_i = 1'b1;
     clk_delay(1);
-    if (c_o !== '0) $fatal(1, "acc_clr_i did not clear the result.");
+    if (c_o !== '0)
+      $fatal(1, "FAIL accumulator-clear test at %0t: acc_clr=%b, context=%0d; got=0x%h, expected all zeros",
+             $time, acc_clr_i, acc_context_i, c_o);
     for (int ctx = 0; ctx < NumContexts; ctx++) context_golden[ctx] = '0;
-    for (int ctx = 0; ctx < NumContexts; ctx++) context_block(ctx, 1'b0, 51);
+    for (int ctx = 0; ctx < NumContexts; ctx++)
+      context_block(ctx, 1'b0, 51, "accumulate after clear");
 
     // Initializing one row must not destroy the remaining row contexts.
-    context_block(0, 1'b1, 97);
-    for (int ctx = 0; ctx < NumContexts; ctx++) context_block(ctx, 1'b0, 101);
+    context_block(0, 1'b1, 97, "reinitialize context zero");
+    for (int ctx = 0; ctx < NumContexts; ctx++)
+      context_block(ctx, 1'b0, 101, "context isolation after reinitialization");
 
     // Asynchronous reset with live contexts, followed by fresh accumulation.
     @(negedge clk_i);
@@ -265,19 +273,22 @@ module tb_mac_array;
     init_save_i = 1'b0;
     rst_ni = 1'b0;
     #1;
-    if (c_o !== '0) $fatal(1, "Asynchronous reset did not clear the result.");
+    if (c_o !== '0)
+      $fatal(1, "FAIL asynchronous-reset test at %0t: rst_ni=%b; got=0x%h, expected all zeros",
+             $time, rst_ni, c_o);
     for (int ctx = 0; ctx < NumContexts; ctx++) context_golden[ctx] = '0;
     clk_delay(2);
     @(negedge clk_i);
     rst_ni = 1'b1;
-    for (int ctx = 0; ctx < NumContexts; ctx++) context_block(ctx, 1'b0, 113);
+    for (int ctx = 0; ctx < NumContexts; ctx++)
+      context_block(ctx, 1'b0, 113, "accumulate after reset");
     @(negedge clk_i);
     a_valid_i = 1'b0;
     b_valid_i = 1'b0;
     init_save_i = 1'b0;
     clk_delay(2);
-    $display("GLOBAL PASS: MAC array arithmetic, %0d contexts, clear and reset passed.",
-             NumContexts);
+    $display("MAC Array Testbench completed.");
+    $display("All MAC array tests passed!");
     $finish;
   end
 

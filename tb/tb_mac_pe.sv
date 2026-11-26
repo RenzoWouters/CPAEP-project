@@ -127,7 +127,7 @@ module tb_mac_pe;
 
       // Check if answer is correct
       if(golden_c_o !== c_o) begin
-        $display("Error in test %0d", i);
+        $display("Error in test %0d", i + 1);
         for (int j = 0; j < NumInputs; j++) begin
           $display("A[%0d]: %d, B[%0d]: %d",
             j, $signed(a_i[j]), j, $signed(b_i[j]));
@@ -135,11 +135,12 @@ module tb_mac_pe;
         $display("OUT: %d, GOLDEN: %d", $signed(c_o), $signed(golden_c_o));
         $fatal;
       end
-      $display("Test %0d passed.", i);
+      $display("Test %0d passed.", i + 1);
     end
 
     // Finish simulation after some time
     clk_delay(5);
+    $display("MAC PE Testbench completed.");
     $display("All tests passed!");
 
     $finish;

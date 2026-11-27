@@ -14,6 +14,9 @@ roofline_metrics.csv in a roofline folder next to that input CSV.
 One MAC counts as two integer operations. Traffic counts every complete SRAM
 bank word read or written; register accesses are outside this SRAM roofline.
 No workload timings or arithmetic intensities are hardcoded in this script.
+Point labels show AI to three decimals and performance to two decimals; the
+metrics CSV retains higher precision. The figure has no main title or footer,
+so its caption can be supplied by the report.
 """
 
 from __future__ import annotations
@@ -155,6 +158,7 @@ def plot_results(rows: list[dict], output_dir: Path) -> None:
         import matplotlib
         matplotlib.use("Agg")  # Works on machines without a graphical display.
         import matplotlib.pyplot as plt
+        from matplotlib.patches import ConnectionPatch, Rectangle
         from matplotlib.ticker import LogLocator, StrMethodFormatter, MaxNLocator
     except ImportError as exc:
         raise RuntimeError(
@@ -174,7 +178,7 @@ def plot_results(rows: list[dict], output_dir: Path) -> None:
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 11,
                          "pdf.fonttype": 42, "svg.fonttype": "none"})
     fig, ax = plt.subplots(figsize=(11, 6.5))
-    fig.subplots_adjust(left=0.09, right=0.97, bottom=0.15, top=0.88)
+    fig.subplots_adjust(left=0.09, right=0.97, bottom=0.12, top=0.97)
     ax.set_xscale("log", base=2)
     ax.set_yscale("log", base=2)
     ax.set_xlim(x_min, x_max)
@@ -182,16 +186,21 @@ def plot_results(rows: list[dict], output_dir: Path) -> None:
     ax.plot([x_min, knee, x_max], [bandwidth * x_min, peak, peak],
             color="#263746", linewidth=2.3, label="Theoretical roofline", zorder=2)
     ax.vlines(knee, y_min, peak, color="#8998a5", linestyles="dashed", linewidth=1)
-    ax.annotate(f"Knee: {knee:g} OP/byte", xy=(knee, peak), xytext=(-10, 31),
-                textcoords="offset points", ha="right", fontsize=10, color="#566675")
     ax.text(0.985, peak * 1.12, f"Peak compute: {peak:g} OP/cycle",
             transform=ax.get_yaxis_transform(), ha="right", fontsize=11)
     slope_x = max(x_min * 1.6, min(knee / 6, knee * 0.65))
-    ax.annotate(f"Peak SRAM bandwidth\n{bandwidth:g} bytes/cycle",
+    ax.annotate(f"Peak SRAM bandwidth:\n{bandwidth:g} bytes/cycle",
                 xy=(slope_x, bandwidth * slope_x), xytext=(0.035, 0.53),
                 textcoords="axes fraction", fontsize=10.5, ha="left",
                 arrowprops={"arrowstyle": "-", "color": "#566675"},
                 bbox={"facecolor": "white", "edgecolor": "none", "pad": 2})
+
+    def point_label(row: dict, *, include_units: bool = True) -> str:
+        ai_unit = " OP/byte" if include_units else ""
+        perf_unit = " OP/cycle" if include_units else ""
+        return (f"{row['workload']}\n"
+                f"AI = {row['arithmetic_intensity_ops_per_byte']:.3f}{ai_unit}\n"
+                f"P = {row['throughput_ops_per_cycle']:.2f}{perf_unit}")
 
     gemv_rows = [row for row in rows if row["N"] == 1]
     zoom_gemv = len(gemv_rows) > 1
@@ -216,13 +225,13 @@ def plot_results(rows: list[dict], output_dir: Path) -> None:
             # performances change; leader lines retain the true coordinates.
             label_rows = sorted(subset, key=lambda row: row["throughput_ops_per_cycle"],
                                 reverse=True)
-            spacing = min(0.075, 0.27 / max(1, len(label_rows) - 1))
+            spacing = min(0.12, 0.27 / max(1, len(label_rows) - 1))
             for index, row in enumerate(label_rows):
-                ax.annotate(row["workload"],
+                ax.annotate(point_label(row),
                             xy=(row["arithmetic_intensity_ops_per_byte"],
                                 row["throughput_ops_per_cycle"]),
                             xytext=(0.975, 0.79 - index * spacing),
-                            textcoords="axes fraction", fontsize=10,
+                            textcoords="axes fraction", fontsize=9,
                             color=colors[mode], ha="right", va="center",
                             bbox={"facecolor": "white", "edgecolor": "none", "pad": 1},
                             arrowprops={"arrowstyle": "-", "color": colors[mode],
@@ -231,7 +240,7 @@ def plot_results(rows: list[dict], output_dir: Path) -> None:
             for index, row in enumerate(subset):
                 below = row["throughput_ops_per_cycle"] >= 0.8 * peak
                 dy = -(17 + index * 15) if below else 12 + index * 13
-                ax.annotate(row["workload"],
+                ax.annotate(point_label(row),
                             xy=(row["arithmetic_intensity_ops_per_byte"],
                                 row["throughput_ops_per_cycle"]),
                             xytext=(8, dy), textcoords="offset points", fontsize=10,
@@ -240,7 +249,7 @@ def plot_results(rows: list[dict], output_dir: Path) -> None:
                                         "linewidth": 0.7})
 
     if zoom_gemv:
-        detail = ax.inset_axes([0.60, 0.075, 0.375, 0.34])
+        detail = ax.inset_axes([0.58, 0.075, 0.395, 0.35])
         gx = [row["arithmetic_intensity_ops_per_byte"] for row in gemv_rows]
         gy = [row["throughput_ops_per_cycle"] for row in gemv_rows]
         x_pad = max((max(gx) - min(gx)) * 0.8, statistics.mean(gx) * 0.003)
@@ -249,26 +258,57 @@ def plot_results(rows: list[dict], output_dir: Path) -> None:
         roof_y = [min(peak, bandwidth * value) for value in roof_x]
         y_all = gy + roof_y
         y_pad = max((max(y_all) - min(y_all)) * 0.5, max(y_all) * 0.025)
+        y_lo, y_hi = max(0, min(y_all) - y_pad), max(y_all) + y_pad
         detail.set_xlim(x_lo, x_hi)
-        detail.set_ylim(max(0, min(y_all) - y_pad), max(y_all) + y_pad)
+        detail.set_ylim(y_lo, y_hi)
         detail.plot(roof_x, roof_y, color="#263746", linewidth=1.3)
         detail.scatter(gx, gy, s=34, color=colors["GeMV"], zorder=4)
-        for index, row in enumerate(gemv_rows):
-            last = index == len(gemv_rows) - 1
-            detail.annotate(row["workload"], xy=(gx[index], gy[index]),
-                            xytext=(-5 if last else 5, 10 if last else -13),
-                            textcoords="offset points", ha="right" if last else "left",
-                            fontsize=8, color=colors["GeMV"])
+        # Alternate fixed label bands so the three close operating points
+        # remain legible when AI and performance are included in each label.
+        ordered_gemv = sorted(gemv_rows,
+                              key=lambda row: row["arithmetic_intensity_ops_per_byte"])
+        for index, row in enumerate(ordered_gemv):
+            fraction = index / max(1, len(ordered_gemv) - 1)
+            upper_band = index % 2 == 1
+            label_x = 0.03 + 0.94 * fraction
+            align = "left" if index == 0 else (
+                "right" if index == len(ordered_gemv) - 1 else "center")
+            detail.annotate(point_label(row, include_units=False),
+                            xy=(row["arithmetic_intensity_ops_per_byte"],
+                                row["throughput_ops_per_cycle"]),
+                            xytext=(label_x, 0.94 if upper_band else 0.06),
+                            textcoords="axes fraction", ha=align,
+                            va="top" if upper_band else "bottom",
+                            fontsize=8, color=colors["GeMV"],
+                            bbox={"facecolor": "white", "edgecolor": "none", "pad": 1},
+                            arrowprops={"arrowstyle": "-", "color": colors["GeMV"],
+                                        "linewidth": 0.65, "shrinkA": 3, "shrinkB": 4})
         detail.set_title("GeMV detail (linear axes)", fontsize=9, pad=6)
         detail.set_xlabel("AI [OP/byte]", fontsize=8, labelpad=2)
-        detail.set_ylabel("OP/cycle", fontsize=8, labelpad=2)
+        detail.set_ylabel("P [OP/cycle]", fontsize=8, labelpad=2)
         detail.xaxis.set_major_locator(MaxNLocator(3))
         detail.yaxis.set_major_locator(MaxNLocator(4))
         detail.tick_params(labelsize=8)
         detail.ticklabel_format(style="plain", useOffset=False)
         detail.grid(alpha=0.18)
+        # Main-axes reference/connector lines must not show through the
+        # inset tick labels, which are drawn outside its white plotting area.
+        for tick_label in detail.get_xticklabels() + detail.get_yticklabels():
+            tick_label.set_bbox({"facecolor": "white", "edgecolor": "none", "pad": 0.7})
 
-    ax.set_title("Roofline of the GeMM/GeMV accelerator", fontsize=15, pad=20)
+        # Show the exact zoomed range on the main axes. Explicit connections
+        # to the inset's left corners preserve the intended visual link.
+        connector_color = "#8998a5"
+        ax.add_patch(Rectangle((x_lo, y_lo), x_hi - x_lo, y_hi - y_lo,
+                               fill=False, edgecolor=connector_color,
+                               linewidth=0.8, zorder=3))
+        for source_y, inset_y in ((y_hi, 1), (y_lo, 0)):
+            ax.add_artist(ConnectionPatch(
+                xyA=(x_hi, source_y), coordsA=ax.transData,
+                xyB=(0, inset_y), coordsB=detail.transAxes,
+                axesA=ax, axesB=detail, color=connector_color,
+                linewidth=0.9, clip_on=False, zorder=1.5))
+
     ax.set_xlabel("Arithmetic intensity [OP/byte]", labelpad=10)
     ax.set_ylabel("Achieved performance [OP/cycle]", labelpad=10)
     for axis in (ax.xaxis, ax.yaxis):
@@ -277,9 +317,6 @@ def plot_results(rows: list[dict], output_dir: Path) -> None:
     ax.grid(which="major", alpha=0.18)
     ax.set_axisbelow(True)
     ax.legend(loc="lower left", fontsize=9, framealpha=0.95)
-    fig.text(0.5, 0.025,
-             "1 MAC = 2 integer operations. SRAM traffic includes complete read and write bank words.",
-             ha="center", fontsize=9, color="#566675")
     for extension in ("png", "pdf", "svg"):
         fig.savefig(output_dir / f"roofline.{extension}", dpi=240, bbox_inches="tight")
     plt.close(fig)

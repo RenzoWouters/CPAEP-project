@@ -222,7 +222,8 @@ def plot_results(rows: list[dict], output_dir: Path) -> None:
                         arrowprops={"arrowstyle": "-", "color": colors[mode]})
         elif mode == "GeMM":
             # A fixed label column prevents collisions when the measured
-            # performances change; leader lines retain the true coordinates.
+            # performances change; leaders attach to the labels' left edges.
+            # Higher labels render after lower leaders to protect their text.
             label_rows = sorted(subset, key=lambda row: row["throughput_ops_per_cycle"],
                                 reverse=True)
             spacing = min(0.12, 0.27 / max(1, len(label_rows) - 1))
@@ -232,10 +233,11 @@ def plot_results(rows: list[dict], output_dir: Path) -> None:
                                 row["throughput_ops_per_cycle"]),
                             xytext=(0.975, 0.79 - index * spacing),
                             textcoords="axes fraction", fontsize=9,
+                            zorder=3.3 - 0.05 * index,
                             color=colors[mode], ha="right", va="center",
                             bbox={"facecolor": "white", "edgecolor": "none", "pad": 1},
                             arrowprops={"arrowstyle": "-", "color": colors[mode],
-                                        "linewidth": 0.7})
+                                        "linewidth": 0.7, "relpos": (0, 0.5)})
         else:
             for index, row in enumerate(subset):
                 below = row["throughput_ops_per_cycle"] >= 0.8 * peak
@@ -273,7 +275,7 @@ def plot_results(rows: list[dict], output_dir: Path) -> None:
             label_x = 0.03 + 0.94 * fraction
             align = "left" if index == 0 else (
                 "right" if index == len(ordered_gemv) - 1 else "center")
-            detail.annotate(point_label(row, include_units=False),
+            detail.annotate(point_label(row),
                             xy=(row["arithmetic_intensity_ops_per_byte"],
                                 row["throughput_ops_per_cycle"]),
                             xytext=(label_x, 0.94 if upper_band else 0.06),

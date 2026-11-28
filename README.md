@@ -1,38 +1,48 @@
-# CPAEP Project Template
-- This project template is for the CPAEP class for the AY 2025-2026 in KU Leuven
-- This template serves as a base repository for running RTL simulations.
-- Preferrably, setup your work in a linux subsystem with Questasim tool.
-- Please use the ESAT computers for this exercise.
+# CPAEP — GeMM/GeMV Accelerator
 
-# Quick Start
-We already prepared the entire Questasim simulation setup for you. Simply invoke the command below to run a simulation without GUI.
+A 512-multiplier accelerator for GeMM and GeMV with signed int8 inputs and int32 outputs.
 
-```bash
-make TEST_MODULE=tb_one_mac_gemm questasim-run
-```
+## Run the simulation
 
-To run with a GUI do:
+Run the commands from the repository root in a Linux terminal with QuestaSim available. Enable it if needed:
 
 ```bash
-make TEST_MODULE=tb_one_mac_gemm questasim-run-gui
+source questa_setup.sh
 ```
 
-In either case, you should see a log that says:
+Run the complete accelerator testbench without the GUI:
 
 ```bash
-Some long log of the previous tests.
-...
-# Test number: 8
-# M: 9, K: 13, N: 10
-# GEMM operation completed in 1170 cycles
-# Result matrix C verification passed!
-# Test number: 9
-# M: 11, K: 16, N: 3
-# GEMM operation completed in 528 cycles
-# Result matrix C verification passed!
-# All test tasks completed successfully!
-# ** Note: $finish    : tb/tb_one_mac_gemm.sv(286)
-#    Time: 410816 ns  Iteration: 0  Instance: /tb_one_mac_gemm
-# End time: 10:12:59 on Nov 27,2025, Elapsed time: 0:00:01
-# Errors: 0, Warnings: 3
+make TEST_MODULE=tb_mac_array_gemm questasim-run
 ```
+
+Or with the GUI:
+
+```bash
+make TEST_MODULE=tb_mac_array_gemm questasim-run-gui
+```
+
+To run another testbench, replace `tb_mac_array_gemm` in the commands above with the corresponding name:
+
+| Testbench | What it tests |
+| --- | --- |
+| `tb_mac_array_gemm` | Complete accelerator: GeMM/GeMV correctness, boundary cases, reset/restart behavior and SRAM protocol checks. |
+| `tb_mac_array` | Array dot products, accumulation across blocks and contexts, accumulator clearing and reset. |
+| `tb_gemm_controller_mac_array` | Controller indices, pipeline timing, stalls, dimension boundaries and consecutive jobs without reset. |
+| `tb_one_mac_gemm` | Original single-MAC accelerator on six small GeMM/GeMV cases. |
+| `tb_mac_pe` | Random signed dot products in the supplied MAC PE. |
+| `tb_ceiling_counter` | Tick-driven counting with different ceiling values and clearing between tests. |
+| `tb_single_port_memory` | Sequential writes and reads of random data, compared against reference values. |
+
+In the global `tb_mac_array_gemm` testbench, the SRAM negative test intentionally prints eight error messages. The simulation must still end with the message that all matrix cases and reset/restart tests passed.
+
+## Generate the roofline plot
+
+After a successful simulation exports `roofline_results.csv`, run:
+
+```bash
+python3 -m pip install matplotlib  # Only needed once
+python3 plot_roofline.py roofline_results.csv
+```
+
+The figures are saved in `roofline/`.

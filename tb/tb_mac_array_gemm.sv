@@ -129,7 +129,7 @@ module tb_mac_array_gemm;
    '{"GeMM C exact", GemmRows+1, NumInputs, CElements, 0},
    '{"GeMM C above", GemmRows+1, NumInputs+1, CElements+1, 0},
 
-   // Multiple B64 responses assemble one shared GeMV vector fragment.
+   /// GeMV cases with K just below, equal to, and above BElements.
    '{"GeMV B below", NumCores+1, BElements-1, 1, 0},
    '{"GeMV B exact", NumCores+1, BElements, 1, 0},
    '{"GeMV B above", NumCores+1, BElements+1, 1, 0},
@@ -138,14 +138,14 @@ module tb_mac_array_gemm;
    '{"GeMM poison tails", GemmRows+1, NumInputs+1, GemmCols+1, 0},
    '{"GeMV poison tails", NumCores+1, NumInputs+1, 1, 0},
 
-   // With A832, 13 x512-byte tiles occupy exactly 64 x104-byte words.
-   // Exercise the short read interval, its following tile, and end-of-job
-   // handling immediately before/on/after that physical alignment boundary.
+   // GeMV streams with 12, 13 and 14 K blocks. 
+   // Exercise repeated A-tile loading and correct completion after the final tile.
    '{"GeMV stream 12", NumCores, 12*NumInputs, 1, 0},
    '{"GeMV stream 13", NumCores, 13*NumInputs, 1, 0},
    '{"GeMV stream 14", NumCores, 14*NumInputs, 1, 0},
 
-   // Same alignment period across M groups; every tile produces a C group.
+   // Multiple 16-row tiles with one K block per tile.
+   // Every tile produces a completed C result group.
    '{"GeMV stream M", 14*NumCores, NumInputs, 1, 0},
 
    // Carry must preserve stream order across both K/M boundaries. Nonzero
@@ -771,8 +771,9 @@ module tb_mac_array_gemm;
     previous_bank_re=bank_re; previous_bank_we=bank_we;
   end
 
-  // Head may pop TWO entries in one cycle. Check the actual modulo-depth
-  // successor, including a pair spanning slot24 ->0 and simultaneous reserve.
+  // Head may pop TWO entries in one cycle. Check pointer wraparound at the
+  // configured queue depth, including a pair spanning the last slot -> slot 0
+  // and simultaneous reservation of a new entry.
   always @(posedge clk_i) begin : monitor_queue
     int unsigned pop_count;
     if(!rst_ni || !queue_observation_active) begin

@@ -71,6 +71,7 @@ module gemm_controller_mac_array #(
   localparam int unsigned GemmCols = (GemmRows == 0) ? 1 : NumCores/GemmRows;
   localparam int unsigned NumContexts = (GemmRows == 0) ? 1 : MReuse/GemmRows;
   localparam int unsigned GemvGroupRows = NumContexts*NumCores;
+
   // A ceiling must represent NumContexts itself, not only NumContexts-1.
   localparam int unsigned RowWidth = (NumContexts <= 1) ? 1 : $clog2(NumContexts + 1);
   localparam int unsigned CalcWidth = ((AddrWidth > 32) ? AddrWidth : 32) + 1;
@@ -87,7 +88,9 @@ module gemm_controller_mac_array #(
   assign is_gemv   = (N_size_i == {{(AddrWidth-1){1'b0}}, 1'b1});
   assign is_gemv_o = is_gemv;
 
-  // Pipeline registers that follow the read latency of the SRAMs
+  // Pipeline control for complete operand blocks accepted from the top module.
+  // data_valid/init_save follow acceptance by one register stage;
+  // result_valid follows a last-K acceptance by two register stages.
   logic data_valid_q;    // A/B data at the MAC inputs is valid
   logic first_k_q;       // ... and it is the first K block of an output
   logic last_k_q;        // ... and it is the last K block of an output
@@ -106,6 +109,7 @@ module gemm_controller_mac_array #(
   assign busy_o = (current_state == ControllerBusy  ) ||
                   (current_state == ControllerDrain ) ||
                   (current_state == ControllerFinish);
+                  
   // Keep acceptance independent of the next-state calculation. Terminal
   // counter pulses feed next_state, but never feed acceptance back into itself.
   assign move_counter = input_valid_i &&

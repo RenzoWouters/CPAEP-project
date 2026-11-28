@@ -4,7 +4,7 @@
 // The supplied SRAM internals and their synchronous read latency are unchanged.
 //
 // GeMM: 2 M x8 N x32 K, MReuse rows per B tile, unchanged accumulator contexts.
-// Banks0..3 deliver a64-byte A row pair; banks4..5 deliver32 B bytes; banks6..7
+// Banks1..4 deliver a64-byte A row pair; banks5..6 deliver32 B bytes; banks7..8
 // write eight int32 outputs. Two B tile buffers and two A slots hide input reads.
 //   A: addr=(m/2)*ceil(K/32)+k/32; byte=(m%2)*32+k%32, across banks0..3.
 //   B: addr=((n/8)*ceil(K/32)+k/32)*8+((n%8)*32+k%32)/32,
@@ -87,6 +87,7 @@ module gemm_accelerator_top_mac_array #(
   localparam int unsigned StepWidth = (MaxStep <= 1) ? 1 : $clog2(MaxStep);
   localparam int unsigned CountWidth = ((SizeAddrWidth > StepWidth) ? SizeAddrWidth : StepWidth) + 1;
   localparam int unsigned CalcWidth = 2*CountWidth + 2;
+
   // Encodings retained for the integration testbench's reset phase probes.
   typedef enum logic [2:0] {
     TopIdle, TopStart, TopLoad, TopFlush, TopIssue, TopDrain, TopCache, TopCacheFlush
@@ -188,6 +189,7 @@ module gemm_accelerator_top_mac_array #(
   assign active_job = (state_q == TopLoad) || (state_q == TopFlush) || (state_q == TopIssue);
   assign issue_phase = (state_q == TopFlush) || (!is_gemv && (state_q == TopIssue));
   assign output_slot_busy_q = (output_queue_used_q == QueueCountWidth'(QueueDepth));
+
   // Count a C stall only when an otherwise-ready block is blocked by C.
   assign output_stall = issue_phase && last_k_block && output_slot_busy_q && !last_c_write &&
                         (is_gemv || (b_valid_q[b_compute_bank_q] && a_ready_q[a_head_q]));
@@ -293,6 +295,7 @@ module gemm_accelerator_top_mac_array #(
      (CalcWidth'(K_count)/CalcWidth'(GemvFragmentElements)));
   assign gemv_read_m = gemv_prefetch ? gemv_next_m : CalcWidth'(M_count);
   assign gemv_read_k = gemv_prefetch ? gemv_next_k : CalcWidth'(K_count);
+
   // At a fragment boundary the issue edge can request the next B word.
   // Its synchronous response updates shared_q one edge later, AFTER that
   // edge's MAC has consumed the old fragment. A loading starts immediately.
@@ -560,6 +563,7 @@ module gemm_accelerator_top_mac_array #(
       end
     end
   end
+
   assign c_valid_q = c_ready_q[c_head_q];
   assign c_base_q = c_addresses_q[c_head_q];
   assign c_count_q = c_counts_q[c_head_q];
@@ -687,6 +691,7 @@ module gemm_accelerator_top_mac_array #(
         (GemvFragmentElements % NumInputs) != 0)
       $fatal(1, "GeMV fragment must fit the existing128-byte shared payload and whole K blocks.");
   end
+
   always @(posedge clk_i) begin
     if (rst_ni) begin
       if (accept_start && (M_size_i == '0 || K_size_i == '0 || N_size_i == '0))
@@ -756,6 +761,7 @@ module gemm_accelerator_top_mac_array #(
     c_ready_q, c_data_q, c_addresses_q, c_counts_q, c_row_counts_q,
     fifo_pending_valid_q, fifo_pending_slot_q, c_core_q
   });
+  
   initial begin
     #0;
     metrics_pkg::area += real'(TopRegisterBits)/32.0;
